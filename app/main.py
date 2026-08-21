@@ -9,7 +9,9 @@ import logging
 
 from flask import Flask, jsonify
 
+from .ga4 import fetch_ga4_metrics
 from .scheduler import start_scheduler, run_growth_brief_job
+from .search_console import fetch_search_console_metrics
 
 logging.basicConfig(level=logging.INFO)
 
@@ -20,6 +22,33 @@ start_scheduler()
 @app.get('/health')
 def health():
     return jsonify({'status': 'ok'})
+
+
+@app.get('/debug/ga4')
+def debug_ga4():
+    """Calls fetch_ga4_metrics() directly and returns the raw JSON - no LLM
+    call, no email send. Use this to verify GA4 service-account credentials
+    and property ID without triggering a real (billed) /run-now.
+    """
+    try:
+        return jsonify(fetch_ga4_metrics())
+    except Exception as exc:
+        logging.exception('debug/ga4 failed')
+        return jsonify({'status': 'error', 'error': str(exc)}), 500
+
+
+@app.get('/debug/search-console')
+def debug_search_console():
+    """Calls fetch_search_console_metrics() directly and returns the raw
+    JSON - no LLM call, no email send. Use this to verify Search Console
+    service-account credentials and site URL without triggering a real
+    (billed) /run-now.
+    """
+    try:
+        return jsonify(fetch_search_console_metrics())
+    except Exception as exc:
+        logging.exception('debug/search-console failed')
+        return jsonify({'status': 'error', 'error': str(exc)}), 500
 
 
 @app.post('/run-now')

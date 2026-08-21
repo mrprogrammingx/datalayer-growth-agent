@@ -6,6 +6,11 @@ services:
     # No `ports:` - this must never be publicly reachable or routed through
     # nginx. Use `docker exec` or curl from another container on the same
     # network to hit /health or /run-now for manual testing.
+    volumes:
+      # Read-only bind mount for the GA4/Search Console service-account JSON
+      # key. This file is per-host (gitignored, never committed) - see README
+      # for how to get it onto each host.
+      - ./secrets:/app/secrets:ro
     networks:
       - datalayer_shared
 

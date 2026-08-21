@@ -1,17 +1,26 @@
-"""Pulls DataLayer's own signup/upload/lead metrics for the growth brief.
+"""Pulls DataLayer's own signup/upload/lead metrics, plus GA4 traffic/funnel
+data and Search Console query/page data, for the growth brief.
 
 Every function returns plain JSON-serializable dicts/lists only - no raw
 cursor rows or DB objects - since the output of collect_metrics() is fed
 straight into the LLM prompt in brief.py.
 
-There is no page-visit or tool-usage tracking table in this database
-(that only exists in GA4, which is out of scope for V0) - this module
-must never claim to have traffic/funnel data it doesn't have.
+GA4 and Search Console fetches are each wrapped in their own try/except:
+a failure there must not crash the whole brief or block the email, since
+the DB-only brief is still valuable on its own - it just means data_gaps
+gets a specific note about what failed and why. This is different from
+the DB/LLM/email failures in the rest of the pipeline, which correctly
+stay fail-loud since there's no fallback for those.
 """
+import logging
 from datetime import date, timedelta
 from typing import Any, Dict, List
 
 from .db import connect_to_db
+from .ga4 import fetch_ga4_metrics
+from .search_console import fetch_search_console_metrics
+
+LOGGER = logging.getLogger(__name__)
 
 WINDOW_DAYS = 30
 
@@ -77,6 +86,22 @@ def collect_metrics() -> Dict[str, Any]:
 
     paying_customers = sum(n for tier, n in plan_tiers.items() if tier not in ('free', 'unknown'))
 
+    data_gaps: List[str] = []
+
+    ga4_metrics = None
+    try:
+        ga4_metrics = fetch_ga4_metrics()
+    except Exception as exc:
+        LOGGER.exception('GA4 fetch failed')
+        data_gaps.append(f'GA4 traffic/funnel data unavailable this run: {exc}')
+
+    search_console_metrics = None
+    try:
+        search_console_metrics = fetch_search_console_metrics()
+    except Exception as exc:
+        LOGGER.exception('Search Console fetch failed')
+        data_gaps.append(f'Search Console query/page data unavailable this run: {exc}')
+
     return {
         'generated_at': today.isoformat(),
         'window_days': WINDOW_DAYS,
@@ -85,9 +110,7 @@ def collect_metrics() -> Dict[str, Any]:
         'csv_tool_leads': leads,
         'plan_tier_distribution': plan_tiers,
         'paying_customers': paying_customers,
-        'data_gaps': [
-            'No website traffic or per-page/per-tool visit tracking is available in this '
-            'database (GA4/Search Console not yet wired in - Phase 1). Only signup, upload, '
-            'and free-tool-lead events below are real, measured data.'
-        ],
+        'ga4': ga4_metrics,
+        'search_console': search_console_metrics,
+        'data_gaps': data_gaps,
     }
