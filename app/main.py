@@ -27,8 +27,8 @@ def health():
 @app.get('/debug/ga4')
 def debug_ga4():
     """Calls fetch_ga4_metrics() directly and returns the raw JSON - no LLM
-    call, no email send. Use this to verify GA4 service-account credentials
-    and property ID without triggering a real (billed) /run-now.
+    call, no email send. Use this to verify GA4 OAuth credentials and
+    property ID without triggering a real (billed) /run-now.
     """
     try:
         return jsonify(fetch_ga4_metrics())
@@ -41,8 +41,8 @@ def debug_ga4():
 def debug_search_console():
     """Calls fetch_search_console_metrics() directly and returns the raw
     JSON - no LLM call, no email send. Use this to verify Search Console
-    service-account credentials and site URL without triggering a real
-    (billed) /run-now.
+    OAuth credentials and site URL without triggering a real (billed)
+    /run-now.
     """
     try:
         return jsonify(fetch_search_console_metrics())

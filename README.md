@@ -5,7 +5,8 @@ Internal growth system for DataLayer (usedatalayer.com). Once a day it:
 1. Reads DataLayer's own Postgres metrics (signups, uploads, free-tool leads) via a
    read-only DB role.
 2. Reads real GA4 traffic/funnel data (sessions, per-tool-page views, funnel event
-   counts) and Search Console data (top queries/pages) via Google service-account APIs.
+   counts) and Search Console data (top queries/pages) via Google APIs, authenticated
+   with a personal OAuth refresh token (not a service account).
 3. Sends all of that to an LLM (`gpt-4o-mini`) to identify the single biggest growth
    problem, compute real funnel drop-off, surface SEO opportunities, and rank
    recommended actions.
@@ -45,10 +46,14 @@ network, same as datalayer-ecommerce's own internal `web` → `db` connection.
 
 ## 2. Google Analytics / Search Console setup
 
-The growth brief pulls real GA4 and Search Console data via a dedicated read-only Google
-service account. This needs its own GCP project — GA4 and Search Console are Google
-account features independent of any GCP project, so a fresh project works fine and
-doesn't require locating or reusing any prior Google Cloud setup.
+The growth brief pulls real GA4 and Search Console data via **OAuth using your own
+Google account** — NOT a service account. `usedatalayer.com` is a Google Workspace
+domain, and Workspace-linked Cloud orgs enforce the `iam.disableServiceAccountKeyCreation`
+policy by default, which blocks downloadable service-account JSON keys entirely
+(Google's own "Secure by Default" setting — don't try to disable it, that reopens the
+exact risk it's there to prevent). OAuth client creation isn't affected by that policy,
+and since it's your own account authorizing, there's no separate "grant access" step
+needed — you already have access to both properties.
 
 1. **Create a new GCP project.** Go to the [Cloud Console](https://console.cloud.google.com/)
    and create a new project (e.g. named `datalayer-growth-agent`). This takes about a
@@ -59,38 +64,39 @@ doesn't require locating or reusing any prior Google Cloud setup.
    - `Google Search Console API`
 
    Both are free — no billing required beyond normal quota limits.
-3. **Create a service account.** Go to **APIs & Services > Credentials > Create
-   Credentials > Service account**. Name it something like
-   `growth-agent-readonly` (resulting email:
-   `growth-agent-readonly@<project-id>.iam.gserviceaccount.com`).
-4. **Generate a JSON key.** Open the new service account > **Keys > Add Key > Create new
-   key > JSON**, and download it.
-5. **Grant GA4 access.** In [GA4](https://analytics.google.com/), go to **Admin > Property
-   Access Management > Add users**, paste the service account's email, and grant it the
-   **Viewer** role.
-6. **Grant Search Console access.** In
-   [Search Console](https://search.google.com/search-console), go to **Settings > Users
-   and permissions > Add user**, paste the service account's email, and grant it
-   **Restricted** permission (sufficient for read-only Search Analytics queries).
-7. **Record the GA4 Property ID.** In GA4, go to **Admin > Property Settings** and copy
+3. **Configure the OAuth consent screen.** Go to **APIs & Services > OAuth consent
+   screen**. Set **User type** to **Internal** (available because this project is under
+   the `usedatalayer.com` Workspace domain) — this is important: an **External** app left
+   in Testing mode has refresh tokens that silently expire after 7 days, which would
+   break this a week after setup with no obvious error. Internal apps have no such expiry
+   and need no Google verification review. Fill in the minimal required fields (app name,
+   support email) and save.
+4. **Create an OAuth Client ID.** Go to **APIs & Services > Credentials > Create
+   Credentials > OAuth client ID**. Application type: **Desktop app**. Name it something
+   like `growth-agent-oauth`. Note the **Client ID** and **Client Secret** shown.
+5. **Run the one-time authorization script**, locally, on a machine with a browser (your
+   laptop — not the VPS):
+
+   ```bash
+   pip install google-auth-oauthlib
+   python scripts/authorize_google.py <client_id> <client_secret>
+   ```
+
+   A browser window opens — log in with the Google account that has access to
+   DataLayer's GA4 property and Search Console property, and approve. The script prints a
+   **refresh token**. Paste it into `.env` as `GOOGLE_OAUTH_REFRESH_TOKEN` — this same
+   value (along with the client ID/secret) works on **every host**, unlike a
+   service-account key file, so you only need to run this once and copy the three values
+   to both local dev's `.env` and the VPS's `.env`.
+6. **Record the GA4 Property ID.** In GA4, go to **Admin > Property Settings** and copy
    the numeric **Property ID** (NOT the `G-XXXXXXX` measurement ID used in the site's
    tracking snippet — that's a different identifier). This goes in `.env` as
    `GA4_PROPERTY_ID`.
-8. **Confirm the Search Console property type.** In the Search Console UI, check whether
+7. **Confirm the Search Console property type.** In the Search Console UI, check whether
    the verified property is a **domain property** (shown as `sc-domain:usedatalayer.com`)
    or a **URL-prefix property** (shown as `https://usedatalayer.com/`). Copy the exact
    value shown — this goes in `.env` as `SEARCH_CONSOLE_SITE_URL` and must match exactly
    (including the trailing slash for URL-prefix properties).
-9. **Place the JSON key on each host.** The downloaded key can't travel through git
-   (`secrets/` is gitignored). Copy it out-of-band (e.g. `scp`) to
-   `./secrets/ga-service-account.json` on **each host separately** — local dev and the
-   prod VPS each need their own copy of the same file, even though it's the same
-   credentials.
-
-```bash
-mkdir -p secrets
-# scp the downloaded key to secrets/ga-service-account.json on this host
-```
 
 ## 3. Configure environment
 
@@ -110,8 +116,8 @@ Fill in:
 - `GROWTH_BRIEF_RECIPIENT`
 - `BRIEF_SEND_HOUR_UTC` (default `8`)
 - `GROWTH_AGENT_NETWORK` — see step 4
-- `GOOGLE_APPLICATION_CREDENTIALS`, `GA4_PROPERTY_ID`, `SEARCH_CONSOLE_SITE_URL` — from
-  step 2
+- `GOOGLE_OAUTH_CLIENT_ID`, `GOOGLE_OAUTH_CLIENT_SECRET`, `GOOGLE_OAUTH_REFRESH_TOKEN`,
+  `GA4_PROPERTY_ID`, `SEARCH_CONSOLE_SITE_URL` — from step 2
 
 ## 4. Confirm the Docker network name
 
@@ -157,11 +163,12 @@ print(urllib.request.urlopen('http://localhost:8080/debug/search-console').read(
 "
 ```
 
-If either returns an error, double check: the service account has Viewer/Restricted
-access granted in step 2.5/2.6, `GA4_PROPERTY_ID` is the numeric Property ID (not the
-`G-XXXXXXX` measurement ID), `SEARCH_CONSOLE_SITE_URL` exactly matches the verified
-property's format (`sc-domain:...` vs. `https://.../`), and
-`./secrets/ga-service-account.json` exists on this host and is the mounted path.
+If either returns an error, double check: `GOOGLE_OAUTH_CLIENT_ID`/
+`GOOGLE_OAUTH_CLIENT_SECRET`/`GOOGLE_OAUTH_REFRESH_TOKEN` are all set in `.env` (from
+step 2.5), the OAuth consent screen is set to **Internal** (an External app in Testing
+mode has refresh tokens that expire after 7 days), `GA4_PROPERTY_ID` is the numeric
+Property ID (not the `G-XXXXXXX` measurement ID), and `SEARCH_CONSOLE_SITE_URL` exactly
+matches the verified property's format (`sc-domain:...` vs. `https://.../`).
 
 Only once both debug routes return real, clean data should you move on to a full
 end-to-end test.
@@ -199,14 +206,15 @@ docker-compose.yml
 Dockerfile
 requirements.txt
 .env.example
-secrets/                    Per-host service-account JSON key (gitignored, not in git)
+scripts/
+  authorize_google.py One-time local OAuth authorization helper (not in the Docker image)
 app/
   main.py             Flask app: GET /health, GET /debug/ga4, GET /debug/search-console,
                        POST /run-now
   scheduler.py        APScheduler daily job (default 08:00 UTC)
   db.py               Read-only Postgres connection
   metrics.py          Signup/upload/lead queries + GA4/Search Console merge -> plain JSON
-  google_auth.py      Shared service-account credential helper (GA4 + Search Console)
+  google_auth.py      Shared OAuth credential helper (GA4 + Search Console)
   ga4.py              GA4 Data API: sessions, tool-page views, funnel event counts
   search_console.py   Search Console API: top queries/pages by clicks
   brief.py            Builds LLM prompt, calls OpenAI, returns markdown brief

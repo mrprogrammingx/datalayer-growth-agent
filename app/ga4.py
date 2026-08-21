@@ -16,7 +16,7 @@ from google.analytics.data_v1beta.types import (
     RunReportRequest,
 )
 
-from .google_auth import get_ga4_credentials
+from .google_auth import get_google_credentials
 
 WINDOW_DAYS = 30
 
@@ -70,7 +70,7 @@ def _property_id() -> str:
 
 
 def _client() -> BetaAnalyticsDataClient:
-    return BetaAnalyticsDataClient(credentials=get_ga4_credentials())
+    return BetaAnalyticsDataClient(credentials=get_google_credentials())
 
 
 def _date_range_pair(today: date):

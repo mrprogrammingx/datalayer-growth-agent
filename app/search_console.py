@@ -10,7 +10,7 @@ from typing import Any, Dict, List
 
 from googleapiclient.discovery import build
 
-from .google_auth import get_search_console_credentials
+from .google_auth import get_google_credentials
 
 WINDOW_DAYS = 30
 REPORTING_LAG_DAYS = 3
@@ -58,7 +58,7 @@ def fetch_search_console_metrics() -> Dict[str, Any]:
     start = end - timedelta(days=WINDOW_DAYS)
 
     service = build(
-        'searchconsole', 'v1', credentials=get_search_console_credentials(), cache_discovery=False
+        'searchconsole', 'v1', credentials=get_google_credentials(), cache_discovery=False
     )
 
     return {
