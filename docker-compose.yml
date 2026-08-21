@@ -1,0 +1,26 @@
+services:
+  growth-agent:
+    build: .
+    restart: unless-stopped
+    env_file: .env
+    # No `ports:` - this must never be publicly reachable or routed through
+    # nginx. Use `docker exec` or curl from another container on the same
+    # network to hit /health or /run-now for manual testing.
+    networks:
+      - datalayer_shared
+
+networks:
+  datalayer_shared:
+    # Joins the existing datalayer-ecommerce Postgres/web network (same
+    # compose project on both local dev and the prod VPS - see
+    # docker-compose.prod.yml, which just adds a host port-forward to the
+    # same `db` service) so this container can reach Postgres by hostname
+    # (`db`). Compose's default network name is "<project_dir_name>_default"
+    # - for the sibling ../datalayer-ecommerce repo (no
+    # COMPOSE_PROJECT_NAME override) that's "datalayer-ecommerce_default".
+    # CONFIRM this matches on whichever host you're deploying to:
+    #   docker network ls | grep datalayer
+    # and update `name:` below if it differs (e.g. the VPS clones the repo
+    # into a differently-named directory).
+    name: datalayer-ecommerce_default
+    external: true
