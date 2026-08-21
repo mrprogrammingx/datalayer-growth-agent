@@ -26,7 +26,7 @@ def _markdown_to_html(markdown_text: str) -> str:
     return f'<pre style="font-family: monospace; white-space: pre-wrap; font-size: 14px;">{escaped}</pre>'
 
 
-def send_brief_email(brief_markdown: str) -> dict:
+def send_brief_email(brief_markdown: str, subject: str = 'DataLayer Growth Brief') -> dict:
     api_key = os.environ.get('RESEND_API_KEY')
     from_address = os.environ.get('EMAIL_FROM')
     recipient = os.environ.get('GROWTH_BRIEF_RECIPIENT')
@@ -46,7 +46,7 @@ def send_brief_email(brief_markdown: str) -> dict:
     payload = {
         'from': from_address,
         'to': [recipient],
-        'subject': 'DataLayer Growth Brief',
+        'subject': subject,
         'text': brief_markdown,
         'html': _markdown_to_html(brief_markdown),
     }

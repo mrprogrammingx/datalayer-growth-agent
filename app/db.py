@@ -26,7 +26,7 @@ def _get_database_url() -> str:
     return url
 
 
-def _psycopg2_connect_kwargs(url: str) -> Dict[str, Any]:
+def psycopg2_connect_kwargs(url: str) -> Dict[str, Any]:
     parsed = make_url(url)
     kwargs: Dict[str, Any] = {
         'host': parsed.host,
@@ -41,6 +41,6 @@ def _psycopg2_connect_kwargs(url: str) -> Dict[str, Any]:
 
 def connect_to_db():
     """Return a new read-only psycopg2 connection. Caller must close it."""
-    conn = psycopg2.connect(**_psycopg2_connect_kwargs(_get_database_url()))
+    conn = psycopg2.connect(**psycopg2_connect_kwargs(_get_database_url()))
     conn.set_session(readonly=True, autocommit=True)
     return conn

@@ -1,16 +1,19 @@
-"""Internal-only Flask app: boots the scheduler, serves /health and /run-now.
+"""Internal-only Flask app: boots the scheduler, serves /health and manual
+trigger routes.
 
 Not routed through nginx and has no published port in docker-compose.yml -
-/run-now triggers a real OpenAI call and a real email send, so it must
-never be publicly reachable. Use `docker exec` or curl from inside the
-Docker network to hit it for manual testing.
+/run-now and /weekly-report-now both send real emails (/run-now also makes
+a real, billed OpenAI call), so this must never be publicly reachable. Use
+`docker exec` or curl from inside the Docker network to hit it for manual
+testing.
 """
 import logging
 
 from flask import Flask, jsonify
 
 from .ga4 import fetch_ga4_metrics
-from .scheduler import start_scheduler, run_growth_brief_job
+from .reddit_discovery import fetch_reddit_discussions
+from .scheduler import start_scheduler, run_growth_brief_job, run_weekly_report_job
 from .search_console import fetch_search_console_metrics
 
 logging.basicConfig(level=logging.INFO)
@@ -51,6 +54,19 @@ def debug_search_console():
         return jsonify({'status': 'error', 'error': str(exc)}), 500
 
 
+@app.get('/debug/reddit')
+def debug_reddit():
+    """Calls fetch_reddit_discussions() directly and returns the raw JSON -
+    no LLM call, no email send. Use this to verify Reddit API credentials
+    without triggering a real (billed) /run-now.
+    """
+    try:
+        return jsonify(fetch_reddit_discussions())
+    except Exception as exc:
+        logging.exception('debug/reddit failed')
+        return jsonify({'status': 'error', 'error': str(exc)}), 500
+
+
 @app.post('/run-now')
 def run_now():
     """Manual trigger for testing. Makes a real OpenAI API call and sends a
@@ -62,6 +78,20 @@ def run_now():
         return jsonify({'status': 'sent', 'brief': brief_markdown})
     except Exception as exc:
         logging.exception('run-now failed')
+        return jsonify({'status': 'error', 'error': str(exc)}), 500
+
+
+@app.post('/weekly-report-now')
+def weekly_report_now():
+    """Manual trigger for testing. Deterministic, no LLM call and no
+    OpenRouter cost (unlike /run-now) - still sends a real email via
+    Resend, so still confirm before triggering it, same as /run-now.
+    """
+    try:
+        report_text = run_weekly_report_job()
+        return jsonify({'status': 'sent', 'report': report_text})
+    except Exception as exc:
+        logging.exception('weekly-report-now failed')
         return jsonify({'status': 'error', 'error': str(exc)}), 500
 
 
