@@ -64,30 +64,51 @@ needed — you already have access to both properties.
    - `Google Search Console API`
 
    Both are free — no billing required beyond normal quota limits.
-3. **Configure the OAuth consent screen.** Go to **APIs & Services > OAuth consent
-   screen**. Set **User type** to **Internal** (available because this project is under
-   the `usedatalayer.com` Workspace domain) — this is important: an **External** app left
-   in Testing mode has refresh tokens that silently expire after 7 days, which would
-   break this a week after setup with no obvious error. Internal apps have no such expiry
-   and need no Google verification review. Fill in the minimal required fields (app name,
-   support email) and save.
+3. **Configure the OAuth consent screen (Google calls this "Google Auth Platform" in the
+   newer Console UI).** Go to **APIs & Services > OAuth consent screen** (or the "Google
+   Auth Platform" entry in the sidebar) and click **Get started**.
+   - **Audience**: set to **External**, NOT Internal — Internal only works if the Google
+     account with GA4/Search Console access belongs to the `usedatalayer.com` Workspace
+     domain. If that access is actually under a personal Gmail account (as it is for
+     DataLayer), Internal mode will always fail with `Error 403: org_internal`, since a
+     personal account can never belong to any Workspace org.
+   - Fill in the minimal required fields (app name, support email, contact email) and
+     finish setup.
+   - Go to the **Audience** tab > **Test users** > **Add users**, and add the Google
+     account (personal Gmail) that actually has GA4/Search Console access.
+   - **Caveat**: apps left in "Testing" publish status sometimes have refresh tokens that
+     expire after ~7 days. If that happens, `/debug/ga4`/`/debug/search-console` will
+     start returning an auth error (caught gracefully, not a crash - see `data_gaps` in
+     the brief) - the fix is just re-running step 5 below once for a fresh token. Not
+     worth chasing app verification/publishing to production to avoid this for a
+     single-user internal tool.
 4. **Create an OAuth Client ID.** Go to **APIs & Services > Credentials > Create
-   Credentials > OAuth client ID**. Application type: **Desktop app**. Name it something
-   like `growth-agent-oauth`. Note the **Client ID** and **Client Secret** shown.
+   Credentials > OAuth client ID** (or the **Clients** tab in Google Auth Platform).
+   Application type: **Desktop app**. Name it something like `growth-agent-oauth`. Note
+   the **Client ID** and **Client Secret** shown.
 5. **Run the one-time authorization script**, locally, on a machine with a browser (your
    laptop — not the VPS):
 
    ```bash
-   pip install google-auth-oauthlib
+   python -m pip install google-auth-oauthlib
    python scripts/authorize_google.py <client_id> <client_secret>
    ```
 
+   (Use `python -m pip install ...` rather than a bare `pip install ...` - on a machine
+   with multiple Python installs, e.g. both conda and system Python, a bare `pip` can
+   silently install into a different interpreter than the one running the script,
+   causing a `ModuleNotFoundError` even though the install reported success.)
+
    A browser window opens — log in with the Google account that has access to
-   DataLayer's GA4 property and Search Console property, and approve. The script prints a
-   **refresh token**. Paste it into `.env` as `GOOGLE_OAUTH_REFRESH_TOKEN` — this same
-   value (along with the client ID/secret) works on **every host**, unlike a
-   service-account key file, so you only need to run this once and copy the three values
-   to both local dev's `.env` and the VPS's `.env`.
+   DataLayer's GA4 property and Search Console property (the one just added as a test
+   user above), and approve. You'll see an "unverified app" warning screen first - that's
+   expected for an app that hasn't gone through Google's review process; click
+   **Advanced > Go to \<app name\> (unsafe)** to proceed, since this is your own app and
+   only you will ever use it. The script then prints a **refresh token**. Paste it into
+   `.env` as `GOOGLE_OAUTH_REFRESH_TOKEN` — this same value (along with the client
+   ID/secret) works on **every host**, unlike a service-account key file, so you only
+   need to run this once and copy the three values to both local dev's `.env` and the
+   VPS's `.env`.
 6. **Record the GA4 Property ID.** In GA4, go to **Admin > Property Settings** and copy
    the numeric **Property ID** (NOT the `G-XXXXXXX` measurement ID used in the site's
    tracking snippet — that's a different identifier). This goes in `.env` as
@@ -165,10 +186,11 @@ print(urllib.request.urlopen('http://localhost:8080/debug/search-console').read(
 
 If either returns an error, double check: `GOOGLE_OAUTH_CLIENT_ID`/
 `GOOGLE_OAUTH_CLIENT_SECRET`/`GOOGLE_OAUTH_REFRESH_TOKEN` are all set in `.env` (from
-step 2.5), the OAuth consent screen is set to **Internal** (an External app in Testing
-mode has refresh tokens that expire after 7 days), `GA4_PROPERTY_ID` is the numeric
-Property ID (not the `G-XXXXXXX` measurement ID), and `SEARCH_CONSOLE_SITE_URL` exactly
-matches the verified property's format (`sc-domain:...` vs. `https://.../`).
+step 2.5), `GA4_PROPERTY_ID` is the numeric Property ID (not the `G-XXXXXXX` measurement
+ID), `SEARCH_CONSOLE_SITE_URL` exactly matches the verified property's format
+(`sc-domain:...` vs. `https://.../`), and — if this used to work and suddenly doesn't —
+the refresh token may have expired (Testing-status apps sometimes expire tokens after
+~7 days; re-run `scripts/authorize_google.py` for a fresh one).
 
 Only once both debug routes return real, clean data should you move on to a full
 end-to-end test.
