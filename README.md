@@ -46,12 +46,13 @@ network, same as datalayer-ecommerce's own internal `web` → `db` connection.
 ## 2. Google Analytics / Search Console setup
 
 The growth brief pulls real GA4 and Search Console data via a dedicated read-only Google
-service account. This reuses the existing GCP project already tied to
-`datalayer-ecommerce` — do not create a new project.
+service account. This needs its own GCP project — GA4 and Search Console are Google
+account features independent of any GCP project, so a fresh project works fine and
+doesn't require locating or reusing any prior Google Cloud setup.
 
-1. **Find the existing GCP project.** Check `GOOGLE_CLOUD_PROJECT_NUMBER` in
-   `../datalayer-ecommerce/.env` and open that project in the
-   [Cloud Console](https://console.cloud.google.com/).
+1. **Create a new GCP project.** Go to the [Cloud Console](https://console.cloud.google.com/)
+   and create a new project (e.g. named `datalayer-growth-agent`). This takes about a
+   minute and is free — no billing account is required for the two read-only APIs below.
 2. **Enable the two APIs.** In that project, go to **APIs & Services > Library** and
    enable:
    - `Google Analytics Data API`
