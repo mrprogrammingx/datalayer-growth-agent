@@ -57,24 +57,25 @@ Fill in:
   sender
 - `GROWTH_BRIEF_RECIPIENT`
 - `BRIEF_SEND_HOUR_UTC` (default `8`)
+- `GROWTH_AGENT_NETWORK` — see step 3
 
-## 3. Wire up the Docker network
+## 3. Confirm the Docker network name
 
 This service has no published port and is not routed through nginx — it must not be
 publicly reachable. It joins the same Docker network as `../datalayer-ecommerce`'s `db`
 service so it can reach Postgres by hostname (`db`).
 
-`docker-compose.yml` here declares that network as `external: true` with
-`name: datalayer-ecommerce_default` — Compose's default network name for a project with
-no `COMPOSE_PROJECT_NAME` override, derived from the sibling repo's directory name.
-**Confirm this matches before first run** (on both your local machine and, separately,
-on the VPS — the clone directory name could differ there):
+`docker-compose.yml` declares that network as `external: true` with its name read from
+`GROWTH_AGENT_NETWORK` in `.env` (default `datalayer-ecommerce_default`, Compose's
+default `<project_dir_name>_default` naming). This is set via `.env` rather than hardcoded
+in `docker-compose.yml` because it varies per host — it depends on what directory name
+`datalayer-ecommerce` was cloned into there (e.g. local dev might use
+`datalayer-ecommerce`, a VPS might use a shorter `datalayer`). **Confirm the actual name
+on whichever host you're deploying to** and set `GROWTH_AGENT_NETWORK` in `.env` to match:
 
 ```bash
 docker network ls | grep datalayer
 ```
-
-If it differs, update the `name:` field in `docker-compose.yml` to match.
 
 ## 4. Run it
 

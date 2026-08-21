@@ -16,11 +16,12 @@ networks:
     # docker-compose.prod.yml, which just adds a host port-forward to the
     # same `db` service) so this container can reach Postgres by hostname
     # (`db`). Compose's default network name is "<project_dir_name>_default"
-    # - for the sibling ../datalayer-ecommerce repo (no
-    # COMPOSE_PROJECT_NAME override) that's "datalayer-ecommerce_default".
-    # CONFIRM this matches on whichever host you're deploying to:
+    # - it differs per host if the datalayer-ecommerce checkout's directory
+    # name differs (e.g. local dev clones it as "datalayer-ecommerce", the
+    # VPS clones it as "datalayer"). Set GROWTH_AGENT_NETWORK in .env to
+    # match - confirm with:
     #   docker network ls | grep datalayer
-    # and update `name:` below if it differs (e.g. the VPS clones the repo
-    # into a differently-named directory).
-    name: datalayer-ecommerce_default
+    # Compose reads .env in this directory automatically for this kind of
+    # substitution, no env_file: wiring needed.
+    name: ${GROWTH_AGENT_NETWORK:-datalayer-ecommerce_default}
     external: true
