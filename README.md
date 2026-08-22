@@ -10,17 +10,19 @@ Internal growth system for DataLayer (usedatalayer.com). Once a day it:
 3. Searches a curated list of subreddits for recent posts relevant to DataLayer's free
    tools, via a read-only Reddit API app.
 4. Sends all of that, plus any of its own prior recommendations still pending, to an LLM
-   (`gpt-4o-mini`) to identify the single biggest growth problem, compute real funnel
-   drop-off, surface SEO opportunities, score and rank recommended actions by
-   Impact x Confidence x Ease (see "Recommended-action scoring" below), and draft
-   Reddit replies / lead outreach messages / LinkedIn-Facebook post ideas.
+   (`gpt-4o-mini`) to identify the single biggest funnel bottleneck, compute real funnel
+   drop-off, surface SEO/content/GEO/community opportunities, and pick exactly ONE #1
+   Priority plus up to 3 Quick Wins and at most one Experiment, each scored and displayed
+   by Impact x Confidence x Ease (see "Brief format and prioritization" below) — and draft
+   Reddit replies / lead outreach messages / LinkedIn-Facebook-Instagram content ideas.
 5. Emails the resulting brief once a day via Resend.
-6. Persists each "Recommended action" / "Suggested experiment" as its own row, so Amir
-   can mark it done/skipped with an outcome note (`scripts/mark_action.py`) and future
-   briefs can reference still-open items instead of repeating them as if new.
-7. For items marked done 7-14 days ago, shows DataLayer's own signup/upload counts in
-   the 7 days before vs. after — correlational, small-sample context only, never
-   presented as evidence of causation (see "Conversion attribution" below).
+6. Persists the #1 Priority and each Quick Win / Experiment as its own row, so Amir can
+   mark it done/skipped with an outcome note (`scripts/mark_action.py`) and future briefs
+   can reference still-open items instead of repeating them as if new.
+7. For items marked done recently enough to fall in the attribution window, shows
+   DataLayer's own signup/upload counts before vs. after, labeled SIGNAL — correlational,
+   small-sample context only, never presented as evidence of causation (see "Conversion
+   attribution" below).
 8. Once a week, sends a separate deterministic rollup email — no LLM call — of
    week-over-week metrics, tracking-item counts, and recent action outcomes (see
    "Automated weekly reporting" below).
@@ -383,9 +385,9 @@ print(urllib.request.urlopen(req).read().decode())
 
 ## 10. Review and resolve tracked items
 
-Each day's "Recommended actions" and "Suggested experiments" get persisted as
-individual rows (after the email sends, so the email itself never contains an item's
-id — `list` is how you find one):
+Each day's #1 Priority, Quick Wins, and Experiment (if any) get persisted as individual rows
+(after the email sends, so the email itself never contains an item's id — `list` is how
+you find one):
 
 ```bash
 docker compose exec growth-agent python scripts/mark_action.py list
@@ -468,9 +470,9 @@ outreach on its own.
 
 ## Action/experiment tracking
 
-Every "Recommended action" and "Suggested experiment" the LLM writes gets persisted as
-its own row (`app/tracking.py`, via a second, write-scoped DB role separate from the
-read-only one — see setup step 2), so it has a stable id, a status
+The #1 Priority, every Quick Win, and the Experiment (if any) the LLM writes get persisted
+as their own row (`app/tracking.py`, via a second, write-scoped DB role separate from
+the read-only one — see setup step 2), so each has a stable id, a status
 (`pending`/`done`/`skipped`), and an optional free-text outcome note. See setup step 10
 for how to review/resolve items via `scripts/mark_action.py`.
 
@@ -521,31 +523,130 @@ string vs. integer id), and `mark_lead()` upserts (unlike `mark_item()`'s UPDATE
 since a lead's email is visible directly in the brief and might be marked before that
 day's registration write ever runs.
 
-## Recommended-action scoring
+## Brief format and prioritization
 
-"Recommended actions" are scored and ranked by **Impact x Confidence x Ease** (each
-1-5, so max score 125) — the original design goal from the project spec, avoiding both
-generic advice ("post more on social media") and an unranked wall of suggestions. Up to
-5 shown, highest score first; fewer than 5 if fewer are genuinely supported by that
-run's data (never padded with filler to reach 5). Each item shows its scores in the
-email, so the ranking is visible, not a black box.
+The daily brief follows a fixed template (`app/brief.py`'s `SYSTEM_PROMPT`): 📊 AT A
+GLANCE → 🎯 #1 PRIORITY → 🔥 QUICK WINS (up to 3) → 📣 CONTENT OPPORTUNITIES (LinkedIn/
+Facebook/Instagram) → 🔎 SEO OPPORTUNITIES → 🤖 GEO/AI SEARCH OPPORTUNITIES → 👤 LEAD
+OUTREACH (up to 3, each with a full draft message) → 💬 COMMUNITY OPPORTUNITIES (Reddit
+only - see below) → 🧪 EXPERIMENT (at most one) → 🧠 WHAT WE'RE LEARNING (FACT/SIGNAL/
+HYPOTHESIS-labeled) → ⚠️ WATCH → 🏁 BOTTOM LINE, each section (and named
+platform/subsection within one, e.g. one of the three Content Opportunities platforms)
+omitted entirely when there's nothing meaningful. This is intentionally a full report,
+not a phone-scan summary - there is no target word count; `WORD_COUNT_WARN_THRESHOLD`
+(1800 words) in `generate_brief()` is a runaway-generation safety net only, not a
+brevity target.
 
-**The sort order is enforced in code, not trusted to the LLM.** Live testing found
-gpt-4o-mini computed scores correctly but got the *list order* wrong on two separate
-real runs, even after the prompt was strengthened with explicit "sort mechanically,
-double-check before finalizing" wording. Rather than keep tightening prompt language
-indefinitely, `app/brief.py`'s `_sort_recommended_actions_by_score()` parses each
-item's `Score:` value out of the LLM's own output and re-sorts it after generation —
-the same philosophy already used for `low_signal`/`NO_CONTROL_GROUP_CAVEAT` in
-conversion attribution: don't trust the model with a mechanical judgment it doesn't
-need to make. No-ops safely (leaves the text unchanged) if the section or any score
-can't be parsed, rather than risk corrupting the brief.
+**Impact x Confidence x Ease scores ARE displayed** — for 🎯 #1 PRIORITY (`Impact: N/5` /
+`Confidence: N/5` / `Ease: N/5` / `Score: N/125`, colon-separated) and for each 🔥 QUICK
+WIN (`Impact N | Confidence N | Ease N | Score N`, pipe-separated, one line per item).
+This is a return to displaying scores after an earlier version of this brief moved them
+to internal-only reasoning - see [[growth-agent-brief-format-rewrite]] in project memory
+for that intermediate step. **The QUICK WINS list is still sorted in code, not trusted
+to the LLM**: this codebase already confirmed twice (original "Recommended actions" ICE
+work) that gpt-4o-mini computes scores correctly but doesn't reliably self-sort a list by
+them. `app/brief.py`'s `_sort_quick_wins_by_score()` re-sorts after generation, tolerant
+of `Ease N | Score N` vs. `Ease: N | Score: N` formatting drift, no-oping safely (leaving
+the brief unchanged, with a warning logged) if the section or a score can't be parsed.
+`_cap_trackable_items()` separately caps the *count* of items the LLM hands back for
+tracking (1 #1 Priority + ≤3 Quick Wins = ≤4 "action", ≤1 "experiment") regardless of
+JSON over-production - a count cap, not a sort, same "verify a mechanical constraint in
+code" philosophy.
+
+## AT A GLANCE metrics
+
+`app/metrics.py`'s `collect_metrics()` precomputes a nested `at_a_glance` dict, grouped
+to match the email's own subheadings, rather than leaving the LLM to pull numbers out of
+the larger `ga4`/DB JSON itself or decide which subheading they belong under - same
+reasoning as `low_signal`/`NO_CONTROL_GROUP_CAVEAT` below: numbers this prominent
+shouldn't depend on the model copying/placing them correctly. A `null` field means that
+source was unavailable this run; the prompt omits that line (or the whole subheading, if
+every field in it is null) rather than showing "null".
+
+- **📈 Acquisition** — `sessions` (`ga4.sessions_and_users`) / `tools`
+  (`ga4.tool_page_funnel_events_last_30_days.csv_uploaded`, actual free-tool usage
+  events, not raw pageviews) — both `null` together if the GA4 fetch failed.
+- **🧩 Product** — `signups`/`uploads` (DB-backed 30-day totals, so these stay available
+  even when GA4 is down) / `activated` — new `_activated_customers()`: count of
+  signed-up users (`users.user_id`) with ≥1 row in `uploads` (in-app upload after
+  signup), an all-time snapshot, not a 30-day window — activation is a milestone a user
+  either has or hasn't reached. Distinct from `uploads` (a 30-day event count) and from
+  `lead_research`'s free-tool leads (pre-signup, keyed on email, no `user_id` at all).
+- **💰 Commercial** — `free_users` (`plan_tier_distribution['free']`) / `paid_customers`
+  (`paying_customers`) - both all-time snapshots, EXTERNAL users only (see "Internal/
+  founder user exclusion" below) / `internal_premium_accounts` - a founder/team account
+  that happens to carry a paid `plan_tier` for testing, shown separately, never folded
+  into `paid_customers`.
+- **👥 Users** — `external` / `internal`, all-time headcounts - the same internal/founder
+  exclusion applied everywhere else in this block, but shown explicitly here rather than
+  silently baked in, so nobody has to wonder whether "signups: 3" secretly includes a
+  founder's own test account.
+
+Note: the email's own "Reporting period: Last 30 days" line describes the Acquisition/
+Product flow metrics (sessions/tools/signups/uploads); `activated`/`free_users`/
+`paid_customers`/`users` are current-state snapshots shown in the same block, per Amir's
+own requested template.
+
+## Internal/founder user exclusion
+
+**Every customer-facing metric in this app excludes founder/team accounts by
+construction** - `app/metrics.py`'s `_internal_users(cur)` identifies them and every
+counting function (`_period_metric`, `_plan_tier_distribution`, `_activated_customers`,
+`_lead_research`, `_resolved_action_outcomes`, and `collect_weekly_datalayer_metrics()`'s
+own queries) threads a `NOT IN` exclusion through at the SQL level via the shared
+`_not_in_clause()` helper. This is deliberately NOT a prompt-only instruction the LLM has
+to remember to apply each run - same "precompute the correct number in Python, don't
+trust the model to get a mechanical constraint right every time" philosophy as
+`low_signal`/`at_a_glance` elsewhere in this file.
+
+**Identification, in priority order:**
+1. **Role flags** (primary) - `users.is_admin` / `users.is_super_admin` (real Postgres
+   booleans already used by the main app for its own admin/permissions system - see
+   `datalayer-ecommerce`'s alembic `0013`/`0014`). Needs zero configuration here; any
+   account flagged either way in the main app is automatically excluded.
+2. **`GROWTH_AGENT_INTERNAL_EMAILS`** (fallback, comma-separated, case-insensitive, empty
+   by default) - covers what role flags structurally can't: a founder/team member who
+   used a free tool with their own personal email but never created a DataLayer account
+   at all (`csv_tool_leads` has no role column - there's nothing to flag), or a team
+   member whose `users` row isn't flagged admin for some other reason.
+
+**What's excluded, and how:**
+- `signups`/`uploads`/`csv_tool_leads` (and everything derived from them:
+  `at_a_glance.product.*`, the weekly report's own signup/upload/lead counts) - internal
+  rows never counted in the first place, not filtered after the fact.
+- `plan_tier_distribution`/`paying_customers`/`free_users`/`activated_customers` - same,
+  via `_plan_tier_distribution(cur, internal_user_ids)` /
+  `_activated_customers(cur, internal_user_ids)`. A mirror function,
+  `_internal_plan_tier_distribution()`, computes the internal-only counterpart so a
+  founder's own test Premium account is still visible somewhere
+  (`internal_premium_accounts`), never silently dropped - it's tracked, just never
+  reported as a paying customer.
+- `lead_research` - internal emails excluded unconditionally at the SQL level in
+  `_lead_research()` itself, before the separate (optional, can fail into a data_gaps
+  note) already-contacted/skipped filtering layer runs. This exclusion has no failure
+  mode of its own to degrade out of.
+- `resolved_action_outcomes` - the daily brief's own conversion-attribution before/after
+  counts (see "Conversion attribution" below) also exclude internal signups/uploads, so a
+  founder testing something around the time an action was marked done can't masquerade
+  as evidence the action worked.
+
+**What's NOT excluded, and why:** GA4 `sessions`/`tools` (`at_a_glance.acquisition`).
+There's no reliable way to separate founder/team pageviews from real visitor sessions
+with the current GA4 property setup (no User-ID tracking configured) - rather than
+silently treat all GA4 traffic as customer traffic, `at_a_glance.acquisition.note` carries
+a fixed, precomputed caveat string (`GA4_INTERNAL_TRAFFIC_NOTE`) that the prompt always
+renders verbatim under 📈 Acquisition: "Internal traffic cannot currently be separated
+from external traffic in this metric." Search Console and Reddit data need no such
+caveat - both only reflect real public-internet activity by construction.
 
 ## Conversion attribution
 
-For items marked `done`, the brief's "Past action outcomes" section shows DataLayer's
-own signup/upload counts in the 7 days immediately before vs. after the item was
-resolved (`app/metrics.py`'s `_resolved_action_outcomes`/`_anchored_window_counts`/
+For items marked `done`, the brief's 🧠 WHAT WE'RE LEARNING section (only when there's
+an eligible entry — most runs there isn't, which is normal) shows DataLayer's own
+signup/upload counts in the days immediately before vs. after the item was resolved,
+always labeled SIGNAL (never FACT - the sample is always too small; see the
+FACT/SIGNAL/HYPOTHESIS evidence discipline the whole brief uses)
+(`app/metrics.py`'s `_resolved_action_outcomes`/`_anchored_window_counts`/
 `_totals_before_after`, `app/tracking.py`'s `get_resolved_items_for_attribution`).
 `skipped` items are excluded (nothing was executed, so a delta isn't meaningful).
 
@@ -568,8 +669,10 @@ no percentage change is ever computed for these entries (a base of 0 or 1 makes 
 percentage misleading), a `low_signal` flag + pre-written explanatory note is computed
 in code whenever the combined before+after total is under 5 (which will be most of the
 time, at DataLayer's actual volume — that's the honest answer, not a mis-tuned
-threshold), and the prompt requires a fixed sentence template rather than open-ended
-"be cautious" language.
+threshold), and the prompt requires a fixed SIGNAL-labeled sentence template
+(`low_signal` ⇒ "still collecting data" + the pre-written note — otherwise the raw
+before/after counts plus the no-control-group caveat) rather than open-ended "be
+cautious" language.
 
 **Known, accepted limitation**: `resolved_at` is when Amir *ran `mark_action.py`*, not
 necessarily when the action actually took effect in the world — if something ships and
@@ -599,7 +702,7 @@ Three sections:
 - **Tracking summary** — items created this week (by category), items resolved this
   week (by status), and the current all-time pending total.
 - **Recent action outcomes** — reuses the *exact same* 7-14-day attribution window and
-  data the daily brief's "Past action outcomes" computes (`app/metrics.py`'s
+  data the daily brief's 🧠 WHAT WE'RE LEARNING section computes (`app/metrics.py`'s
   `get_resolved_action_outcomes()`, shared by both paths). This isn't a coincidence:
   the window's width (7 days) exactly matches the report's weekly cadence, so each
   `done` item appears in exactly one weekly report, with no gaps or overlap. The same

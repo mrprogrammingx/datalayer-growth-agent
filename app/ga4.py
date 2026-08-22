@@ -84,6 +84,24 @@ def _date_range_pair(today: date):
     )
 
 
+def _yesterday_sessions(client: BetaAnalyticsDataClient, today: date) -> int:
+    """Sessions for the single most recent full day, distinct from the
+    30-day rolling `_totals()` above - for the brief's "what happened
+    yesterday" recap (see metrics.py's `yesterday`), not a substitute for
+    the 30-day AT A GLANCE numbers.
+    """
+    yesterday = today - timedelta(days=1)
+    request = RunReportRequest(
+        property=f'properties/{_property_id()}',
+        date_ranges=[DateRange(start_date=yesterday.isoformat(), end_date=yesterday.isoformat())],
+        metrics=[Metric(name='sessions')],
+    )
+    response = client.run_report(request)
+    if response.rows:
+        return int(response.rows[0].metric_values[0].value)
+    return 0
+
+
 def _totals(client: BetaAnalyticsDataClient, today: date) -> Dict[str, Any]:
     last_30_range, prior_30_range = _date_range_pair(today)
     request = RunReportRequest(
@@ -163,6 +181,7 @@ def fetch_ga4_metrics() -> Dict[str, Any]:
     return {
         'window_days': WINDOW_DAYS,
         'sessions_and_users': _totals(client, today),
+        'yesterday_sessions': _yesterday_sessions(client, today),
         'tool_page_sessions_last_30_days': _page_views(client, today),
         'sitewide_funnel_events_last_30_days': _event_counts(client, today, SITEWIDE_EVENTS),
         'tool_page_funnel_events_last_30_days': _event_counts(client, today, TOOL_PAGE_EVENTS),

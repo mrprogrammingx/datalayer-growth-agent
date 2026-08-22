@@ -30,10 +30,19 @@ connection - unlike every other optional field here, a failure in that
 filtering step does not null out lead_research, it falls back to the
 unfiltered (but still capped) list, recorded in data_gaps as a distinct
 "filtering unavailable" note rather than "field unavailable".
+
+INTERNAL/FOUNDER USER EXCLUSION: every customer-facing metric in this
+module (signups, uploads, activation, plan-tier/paid/free counts, lead
+outreach candidates, resolved-action-outcome attribution) excludes
+founder/team accounts by construction, at the SQL level, via
+_internal_users()/_not_in_clause() below - never left as a prompt-only
+instruction the LLM has to remember to apply every run. See _internal_users()
+for how internal accounts are identified.
 """
 import logging
+import os
 from datetime import date, datetime, timedelta
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Tuple
 
 from .db import connect_to_db
 from .ga4 import fetch_ga4_metrics
@@ -60,6 +69,15 @@ LOW_SIGNAL_TOTAL_THRESHOLD = 5
 # the deterministic weekly report.
 NO_CONTROL_GROUP_CAVEAT = (
     'One data point, no control group - directional at most, not proof of effect.'
+)
+
+# GA4 has no reliable way (with the current, non-User-ID GA4 property setup)
+# to separate founder/team pageviews from real visitor sessions - unlike
+# every DB-backed metric in this module, which can be filtered exactly.
+# Precomputed once here (not left for the LLM to remember to caveat) and
+# attached directly to at_a_glance.acquisition below.
+GA4_INTERNAL_TRAFFIC_NOTE = (
+    'Internal traffic cannot currently be separated from external traffic in this metric.'
 )
 
 WEEKLY_WINDOW_DAYS = 7
@@ -93,27 +111,86 @@ LEAD_RESEARCH_FETCH_LIMIT = 50
 LEAD_RESEARCH_DISPLAY_LIMIT = 10
 
 
-def _daily_counts(cur, table: str, ts_column: str, start: date, end: date) -> List[Dict[str, Any]]:
-    """Daily counts of rows in `table` where `ts_column` falls in [start, end)."""
+def _not_in_clause(column_expr: str, values) -> Tuple[str, tuple]:
+    """Builds ("AND {column_expr} NOT IN %s", (tuple(values),)) for use in
+    an f-string SQL WHERE clause, or ('', ()) if `values` is empty - an
+    empty `IN ()`/`NOT IN ()` is invalid SQL, so every caller below must
+    skip the clause entirely rather than pass an empty tuple through.
+    `column_expr` is the raw SQL to filter on (e.g. "user_id",
+    "u.user_id", "LOWER(l.email)") - callers own picking the right
+    qualification for their own query's aliasing.
+    """
+    if not values:
+        return '', ()
+    return f'AND {column_expr} NOT IN %s', (tuple(values),)
+
+
+def _internal_users(cur) -> Tuple[set, set]:
+    """Identifies founder/team accounts, so every customer-facing metric
+    below can exclude them by construction rather than relying on the LLM
+    to remember to. An internal account signing up, uploading, or paying
+    for its own product is never evidence of external growth.
+
+    Primary signal: the app's own `is_admin`/`is_super_admin` role flags on
+    `users` (real Postgres booleans - see datalayer-ecommerce's alembic
+    0013/0014) - preferred over email matching, since it's the app's own
+    existing notion of "not a regular customer" and needs no extra
+    configuration here. Fallback: GROWTH_AGENT_INTERNAL_EMAILS (comma-
+    separated, case-insensitive, unset by default) - the only way to catch
+    a founder/team member who used a free tool with their own personal
+    email but never created a DataLayer account at all (`csv_tool_leads`
+    has no role column - there is nothing to flag there), or a team
+    member whose `users` row isn't flagged admin for some other reason.
+
+    Returns (internal_user_ids: set[int], internal_emails: set[str]
+    lowercased) - two different keys, since `users`/`uploads` filter by
+    user_id but `csv_tool_leads` only has email, no user_id at all.
+    """
+    cur.execute('SELECT user_id, email FROM users WHERE is_admin = true OR is_super_admin = true')
+    rows = cur.fetchall()
+    internal_user_ids = {row[0] for row in rows}
+    internal_emails = {row[1].strip().lower() for row in rows if row[1]}
+
+    env_value = os.environ.get('GROWTH_AGENT_INTERNAL_EMAILS', '')
+    internal_emails |= {email.strip().lower() for email in env_value.split(',') if email.strip()}
+
+    return internal_user_ids, internal_emails
+
+
+def _daily_counts(
+    cur, table: str, ts_column: str, start: date, end: date,
+    exclude_clause: str = '', exclude_params: tuple = (),
+) -> List[Dict[str, Any]]:
+    """Daily counts of rows in `table` where `ts_column` falls in [start, end).
+
+    `exclude_clause`/`exclude_params` (see _not_in_clause) optionally
+    exclude internal/founder rows - every caller in this module that
+    counts `users`/`uploads`/`csv_tool_leads` rows threads this through,
+    so the exclusion logic lives in exactly one place.
+    """
     cur.execute(
         f"""
         SELECT DATE({ts_column}) AS day, COUNT(*) AS n
         FROM {table}
         WHERE {ts_column} >= %s AND {ts_column} < %s
+        {exclude_clause}
         GROUP BY DATE({ts_column})
         ORDER BY day
         """,
-        (start, end),
+        (start, end) + exclude_params,
     )
     return [{'date': row[0].isoformat(), 'count': row[1]} for row in cur.fetchall()]
 
 
-def _period_metric(cur, table: str, ts_column: str, today: date) -> Dict[str, Any]:
+def _period_metric(
+    cur, table: str, ts_column: str, today: date,
+    exclude_clause: str = '', exclude_params: tuple = (),
+) -> Dict[str, Any]:
     last_30_start = today - timedelta(days=WINDOW_DAYS)
     prior_30_start = today - timedelta(days=2 * WINDOW_DAYS)
 
-    last_30_daily = _daily_counts(cur, table, ts_column, last_30_start, today)
-    prior_30_daily = _daily_counts(cur, table, ts_column, prior_30_start, last_30_start)
+    last_30_daily = _daily_counts(cur, table, ts_column, last_30_start, today, exclude_clause, exclude_params)
+    prior_30_daily = _daily_counts(cur, table, ts_column, prior_30_start, last_30_start, exclude_clause, exclude_params)
 
     last_30_total = sum(d['count'] for d in last_30_daily)
     prior_30_total = sum(d['count'] for d in prior_30_daily)
@@ -128,7 +205,26 @@ def _period_metric(cur, table: str, ts_column: str, today: date) -> Dict[str, An
     }
 
 
-def _totals_before_after(cur, table: str, ts_column: str, boundary, window_days: int) -> Dict[str, Any]:
+def _yesterday_count(
+    cur, table: str, ts_column: str, today: date,
+    exclude_clause: str = '', exclude_params: tuple = (),
+) -> int:
+    """Count of rows in `table` for the single most recent full calendar
+    day (today - 1), external-only via the same exclude_clause/params
+    convention as every other counting function here. Distinct from
+    _period_metric()'s 30-day rolling window - this is for the brief's
+    "what happened yesterday" recap, a single day zoomed in, not a
+    substitute for the 30-day AT A GLANCE numbers.
+    """
+    yesterday = today - timedelta(days=1)
+    daily = _daily_counts(cur, table, ts_column, yesterday, today, exclude_clause, exclude_params)
+    return sum(d['count'] for d in daily)
+
+
+def _totals_before_after(
+    cur, table: str, ts_column: str, boundary, window_days: int,
+    exclude_clause: str = '', exclude_params: tuple = (),
+) -> Dict[str, Any]:
     """Shared core for _week_over_week_metric() and _anchored_window_counts():
     two adjacent windows of `window_days` each, split at `boundary` -
     [boundary-window_days, boundary) ("before") and
@@ -142,12 +238,19 @@ def _totals_before_after(cur, table: str, ts_column: str, boundary, window_days:
     """
     before_start = boundary - timedelta(days=window_days)
     after_end = boundary + timedelta(days=window_days)
-    before_total = sum(d['count'] for d in _daily_counts(cur, table, ts_column, before_start, boundary))
-    after_total = sum(d['count'] for d in _daily_counts(cur, table, ts_column, boundary, after_end))
+    before_total = sum(
+        d['count'] for d in _daily_counts(cur, table, ts_column, before_start, boundary, exclude_clause, exclude_params)
+    )
+    after_total = sum(
+        d['count'] for d in _daily_counts(cur, table, ts_column, boundary, after_end, exclude_clause, exclude_params)
+    )
     return {'before_total': before_total, 'after_total': after_total, 'delta': after_total - before_total}
 
 
-def _week_over_week_metric(cur, table: str, ts_column: str, today: date) -> Dict[str, Any]:
+def _week_over_week_metric(
+    cur, table: str, ts_column: str, today: date,
+    exclude_clause: str = '', exclude_params: tuple = (),
+) -> Dict[str, Any]:
     """Week-over-week sibling of _period_metric(), for the weekly report
     only. Not a window_days param on _period_metric() itself - that
     function's return keys (last_30_days/prior_30_days) are hardcoded to
@@ -161,7 +264,8 @@ def _week_over_week_metric(cur, table: str, ts_column: str, today: date) -> Dict
     the weekly report has no LLM present to soften a scary-looking number.
     """
     totals = _totals_before_after(
-        cur, table, ts_column, today - timedelta(days=WEEKLY_WINDOW_DAYS), WEEKLY_WINDOW_DAYS
+        cur, table, ts_column, today - timedelta(days=WEEKLY_WINDOW_DAYS), WEEKLY_WINDOW_DAYS,
+        exclude_clause, exclude_params,
     )
     return {
         'last_7_days': {'total': totals['after_total']},
@@ -173,15 +277,20 @@ def _week_over_week_metric(cur, table: str, ts_column: str, today: date) -> Dict
 def collect_weekly_datalayer_metrics() -> Dict[str, Any]:
     """DB metrics for the weekly report - fail-loud, same philosophy as
     collect_metrics()'s own DB block (no meaningful fallback for a DB
-    failure).
+    failure). Excludes internal/founder accounts, same as the daily brief -
+    see _internal_users().
     """
     today = date.today()
     conn = connect_to_db()
     try:
         cur = conn.cursor()
-        signups = _week_over_week_metric(cur, 'users', 'created_at', today)
-        uploads = _week_over_week_metric(cur, 'uploads', 'uploaded_at', today)
-        leads = _week_over_week_metric(cur, 'csv_tool_leads', 'created_at', today)
+        internal_user_ids, internal_emails = _internal_users(cur)
+        user_clause, user_params = _not_in_clause('user_id', internal_user_ids)
+        email_clause, email_params = _not_in_clause('LOWER(email)', internal_emails)
+
+        signups = _week_over_week_metric(cur, 'users', 'created_at', today, user_clause, user_params)
+        uploads = _week_over_week_metric(cur, 'uploads', 'uploaded_at', today, user_clause, user_params)
+        leads = _week_over_week_metric(cur, 'csv_tool_leads', 'created_at', today, email_clause, email_params)
     finally:
         conn.close()
     return {
@@ -192,41 +301,102 @@ def collect_weekly_datalayer_metrics() -> Dict[str, Any]:
     }
 
 
-def _plan_tier_distribution(cur) -> Dict[str, int]:
+def _plan_tier_distribution(cur, internal_user_ids=frozenset()) -> Dict[str, int]:
+    """Plan-tier counts for EXTERNAL users only (excludes internal_user_ids) -
+    this is what `paying_customers`/`free_users` below are derived from, so
+    a founder's own Premium test account never counts as a paying customer.
+    """
+    clause, params = _not_in_clause('user_id', internal_user_ids)
     cur.execute(
-        """
+        f"""
         SELECT COALESCE(plan_tier, 'unknown') AS tier, COUNT(*) AS n
         FROM users
+        WHERE 1 = 1 {clause}
         GROUP BY tier
         ORDER BY n DESC
-        """
+        """,
+        params,
     )
     return {row[0]: row[1] for row in cur.fetchall()}
 
 
-def _lead_research(cur, limit: int = LEAD_RESEARCH_FETCH_LIMIT) -> List[Dict[str, Any]]:
+def _internal_plan_tier_distribution(cur, internal_user_ids) -> Dict[str, int]:
+    """The mirror image of _plan_tier_distribution() - plan-tier counts for
+    ONLY the internal accounts, so a founder's own test Premium account is
+    still visible somewhere (as "internal/test", per Amir's own rule),
+    never silently dropped.
+    """
+    if not internal_user_ids:
+        return {}
+    cur.execute(
+        """
+        SELECT COALESCE(plan_tier, 'unknown') AS tier, COUNT(*) AS n
+        FROM users
+        WHERE user_id IN %s
+        GROUP BY tier
+        ORDER BY n DESC
+        """,
+        (tuple(internal_user_ids),),
+    )
+    return {row[0]: row[1] for row in cur.fetchall()}
+
+
+def _activated_customers(cur, internal_user_ids=frozenset()) -> int:
+    """Count of signed-up EXTERNAL users who have made >=1 in-app upload,
+    ever - an all-time snapshot, same shape as paying_customers below, not
+    a 30-day window (activation is a milestone a user either has or hasn't
+    reached, not something that resets each month).
+
+    `uploads.user_id` is a nullable FK into `users.user_id`, populated only
+    for in-app uploads by a signed-up user - confirmed against the sibling
+    datalayer-ecommerce repo's schema. This is deliberately distinct from
+    csv_tool_leads (pre-signup free-tool leads, keyed on email, no user_id
+    at all) - activation means using the product AFTER creating an account,
+    per the funnel's own Signup -> Activation -> Paid ordering.
+    """
+    clause, params = _not_in_clause('u.user_id', internal_user_ids)
+    cur.execute(
+        f"""
+        SELECT COUNT(DISTINCT u.user_id) FROM users u
+        JOIN uploads up ON up.user_id = u.user_id
+        WHERE 1 = 1 {clause}
+        """,
+        params,
+    )
+    row = cur.fetchone()
+    return row[0] if row else 0
+
+
+def _lead_research(
+    cur, limit: int = LEAD_RESEARCH_FETCH_LIMIT, internal_emails=frozenset(),
+) -> List[Dict[str, Any]]:
     """Free-tool leads who gave an email but never signed up (no matching
-    `users` row). Deliberately excludes `csv_content` - it can contain a
+    `users` row), EXCLUDING internal/founder emails - a founder testing a
+    free tool with their own email must never surface as an outreach
+    candidate. Deliberately excludes `csv_content` - it can contain a
     lead's own customers' PII (their uploaded order/customer data) and must
     never reach the LLM prompt.
 
     `limit` defaults to LEAD_RESEARCH_FETCH_LIMIT (a wide buffer), not
     LEAD_RESEARCH_DISPLAY_LIMIT (what's actually shown) - collect_metrics()
-    filters and slices down to the display limit afterward. This function
-    itself is unchanged otherwise: still fail-loud, still the same
+    filters (already-contacted/skipped leads, on top of this internal-email
+    exclusion) and slices down to the display limit afterward. This
+    function itself is unchanged otherwise: still fail-loud, still the same
     always-required read-only connection as before lead-outreach tracking
     existed.
     """
+    clause, params = _not_in_clause('LOWER(l.email)', internal_emails)
     cur.execute(
-        """
+        f"""
         SELECT l.email, l.score, l.row_count, l.file_name, l.created_at
         FROM csv_tool_leads l
         LEFT JOIN users u ON u.email = l.email
         WHERE u.email IS NULL
+        {clause}
         ORDER BY l.created_at DESC NULLS LAST
         LIMIT %s
         """,
-        (limit,),
+        params + (limit,),
     )
     return [
         {
@@ -241,7 +411,8 @@ def _lead_research(cur, limit: int = LEAD_RESEARCH_FETCH_LIMIT) -> List[Dict[str
 
 
 def _anchored_window_counts(
-    cur, table: str, ts_column: str, anchor: datetime, window_days: int = ATTRIBUTION_WINDOW_DAYS
+    cur, table: str, ts_column: str, anchor: datetime, window_days: int = ATTRIBUTION_WINDOW_DAYS,
+    exclude_clause: str = '', exclude_params: tuple = (),
 ) -> Dict[str, Any]:
     """Anchored-date sibling of _period_metric(): total counts in `table`
     for the `window_days` immediately before `anchor` vs. immediately
@@ -255,23 +426,29 @@ def _anchored_window_counts(
     than just being uninformative - see LOW_SIGNAL_TOTAL_THRESHOLD/
     brief.py's SYSTEM_PROMPT instead.
     """
-    return _totals_before_after(cur, table, ts_column, anchor, window_days)
+    return _totals_before_after(cur, table, ts_column, anchor, window_days, exclude_clause, exclude_params)
 
 
-def _resolved_action_outcomes(cur, resolved_items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+def _resolved_action_outcomes(
+    cur, resolved_items: List[Dict[str, Any]], internal_user_ids=frozenset(),
+) -> List[Dict[str, Any]]:
     """Computes before/after signup+upload counts for each already-fetched
-    resolved ('done') item, for the "Past action outcomes" brief section.
+    resolved ('done') item, for the "Past action outcomes" brief section -
+    EXTERNAL users only, so a founder's own testing activity around the
+    time an item was marked done can never masquerade as evidence the
+    action worked.
 
     Split from get_resolved_items_for_attribution() deliberately - that
     function uses the tracking connection/role, this one uses the
     read-only connection/role; collect_metrics() is what bridges them via
     a Python merge, so neither role's grants need to change.
     """
+    clause, params = _not_in_clause('user_id', internal_user_ids)
     outcomes = []
     for item in resolved_items:
         anchor = datetime.fromisoformat(item['resolved_at'])
-        signups = _anchored_window_counts(cur, 'users', 'created_at', anchor)
-        uploads = _anchored_window_counts(cur, 'uploads', 'uploaded_at', anchor)
+        signups = _anchored_window_counts(cur, 'users', 'created_at', anchor, exclude_clause=clause, exclude_params=params)
+        uploads = _anchored_window_counts(cur, 'uploads', 'uploaded_at', anchor, exclude_clause=clause, exclude_params=params)
         combined_total = (
             signups['before_total'] + signups['after_total']
             + uploads['before_total'] + uploads['after_total']
@@ -326,7 +503,9 @@ def get_resolved_action_outcomes(
         return []
     conn = connect_to_db()
     try:
-        return _resolved_action_outcomes(conn.cursor(), resolved_items)
+        cur = conn.cursor()
+        internal_user_ids, _ = _internal_users(cur)
+        return _resolved_action_outcomes(cur, resolved_items, internal_user_ids)
     finally:
         conn.close()
 
@@ -336,15 +515,32 @@ def collect_metrics() -> Dict[str, Any]:
     conn = connect_to_db()
     try:
         cur = conn.cursor()
-        signups = _period_metric(cur, 'users', 'created_at', today)
-        uploads = _period_metric(cur, 'uploads', 'uploaded_at', today)
-        leads = _period_metric(cur, 'csv_tool_leads', 'created_at', today)
-        plan_tiers = _plan_tier_distribution(cur)
-        lead_research = _lead_research(cur)
+        internal_user_ids, internal_emails = _internal_users(cur)
+        user_clause, user_params = _not_in_clause('user_id', internal_user_ids)
+        lead_email_clause, lead_email_params = _not_in_clause('LOWER(email)', internal_emails)
+
+        signups = _period_metric(cur, 'users', 'created_at', today, user_clause, user_params)
+        uploads = _period_metric(cur, 'uploads', 'uploaded_at', today, user_clause, user_params)
+        leads = _period_metric(cur, 'csv_tool_leads', 'created_at', today, lead_email_clause, lead_email_params)
+        yesterday_signups = _yesterday_count(cur, 'users', 'created_at', today, user_clause, user_params)
+        yesterday_uploads = _yesterday_count(cur, 'uploads', 'uploaded_at', today, user_clause, user_params)
+        yesterday_leads = _yesterday_count(cur, 'csv_tool_leads', 'created_at', today, lead_email_clause, lead_email_params)
+        plan_tiers = _plan_tier_distribution(cur, internal_user_ids)
+        internal_plan_tiers = _internal_plan_tier_distribution(cur, internal_user_ids)
+        lead_research = _lead_research(cur, internal_emails=internal_emails)
+        activated_customers = _activated_customers(cur, internal_user_ids)
     finally:
         conn.close()
 
+    # All of the below are EXTERNAL-only by construction (see
+    # _internal_users()/_not_in_clause() and every query above) - never
+    # counts a founder/team account as a customer, lead, or growth signal.
     paying_customers = sum(n for tier, n in plan_tiers.items() if tier not in ('free', 'unknown'))
+    free_users = plan_tiers.get('free', 0)
+    external_user_count = sum(plan_tiers.values())
+
+    internal_user_count = len(internal_user_ids)
+    internal_premium_count = sum(n for tier, n in internal_plan_tiers.items() if tier not in ('free', 'unknown'))
 
     data_gaps: List[str] = []
 
@@ -355,7 +551,8 @@ def collect_metrics() -> Dict[str, Any]:
         LOGGER.exception('Lead-outreach exclusion lookup failed')
         data_gaps.append(
             'Lead outreach filtering unavailable this run - showing unconverted leads '
-            f'unfiltered (may include already-contacted/skipped ones): {exc}'
+            f'unfiltered (may include already-contacted/skipped ones, but never internal/'
+            f'founder emails - that exclusion happens earlier and independently): {exc}'
         )
     lead_research = lead_research[:LEAD_RESEARCH_DISPLAY_LIMIT]
 
@@ -400,14 +597,67 @@ def collect_metrics() -> Dict[str, Any]:
         LOGGER.exception('Resolved-action attribution failed')
         data_gaps.append(f'Resolved-action attribution unavailable this run: {exc}')
 
+    # Precomputed exactly, grouped to mirror the AT A GLANCE template's own
+    # subheadings - never left for the LLM to pull a number out of nested
+    # ga4/db structures itself, decide which subheading it belongs under,
+    # or (critically) remember to exclude internal/founder accounts - that
+    # exclusion already happened above, at the SQL level, for every field
+    # here except acquisition.sessions/tools (see GA4_INTERNAL_TRAFFIC_NOTE -
+    # GA4 has no reliable way to separate internal traffic with the current
+    # setup). `null` means "not available this run" (e.g. ga4 fetch
+    # failed) - the prompt is instructed to omit that line, not show a 0 or
+    # guess. `users`/`product.activated`/`commercial.free_users`/
+    # `commercial.paid_customers`/`commercial.internal_premium_accounts`
+    # are all-time snapshots, not 30-day windows like acquisition/signups/
+    # uploads.
+    at_a_glance = {
+        'acquisition': {
+            'sessions': ga4_metrics['sessions_and_users']['last_30_days']['sessions'] if ga4_metrics else None,
+            'tools': ga4_metrics['tool_page_funnel_events_last_30_days']['csv_uploaded'] if ga4_metrics else None,
+            'note': GA4_INTERNAL_TRAFFIC_NOTE,
+        },
+        'users': {
+            'external': external_user_count,
+            'internal': internal_user_count,
+        },
+        'product': {
+            'signups': signups['last_30_days']['total'],
+            'uploads': uploads['last_30_days']['total'],
+            'activated': activated_customers,
+        },
+        'commercial': {
+            'free_users': free_users,
+            'paid_customers': paying_customers,
+            'internal_premium_accounts': internal_premium_count,
+        },
+    }
+
+    # A single most-recent-day recap, distinct from every 30-day number
+    # above - external-only (see `_yesterday_count()`), `sessions` may be
+    # `null` if GA4 failed this run, same convention as at_a_glance.
+    yesterday = {
+        'date': (today - timedelta(days=1)).isoformat(),
+        'sessions': ga4_metrics['yesterday_sessions'] if ga4_metrics else None,
+        'signups': yesterday_signups,
+        'uploads': yesterday_uploads,
+        'leads': yesterday_leads,
+    }
+
     return {
         'generated_at': today.isoformat(),
         'window_days': WINDOW_DAYS,
+        'at_a_glance': at_a_glance,
+        'yesterday': yesterday,
         'signups': signups,
         'uploads': uploads,
         'csv_tool_leads': leads,
         'plan_tier_distribution': plan_tiers,
         'paying_customers': paying_customers,
+        'free_users': free_users,
+        'activated_customers': activated_customers,
+        'external_user_count': external_user_count,
+        'internal_user_count': internal_user_count,
+        'internal_premium_count': internal_premium_count,
         'ga4': ga4_metrics,
         'search_console': search_console_metrics,
         'reddit_discussions': reddit_discussions,
