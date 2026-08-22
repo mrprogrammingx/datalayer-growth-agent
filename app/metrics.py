@@ -154,6 +154,17 @@ def _internal_users(cur) -> Tuple[set, set]:
     env_value = os.environ.get('GROWTH_AGENT_INTERNAL_EMAILS', '')
     internal_emails |= {email.strip().lower() for email in env_value.split(',') if email.strip()}
 
+    # A team member listed only via the env-var fallback (not admin-flagged)
+    # may still have a real `users` row - e.g. a Guest account. Resolve
+    # those emails back to their user_id too, so user_id-keyed exclusions
+    # (plan_tier_distribution, activated_customers, signups/uploads, etc.)
+    # catch them, not just the email-keyed ones (lead_research). Without
+    # this, someone added only via GROWTH_AGENT_INTERNAL_EMAILS could still
+    # leak into every user_id-based "external" count once they'd signed up.
+    if internal_emails:
+        cur.execute('SELECT user_id FROM users WHERE LOWER(email) IN %s', (tuple(internal_emails),))
+        internal_user_ids |= {row[0] for row in cur.fetchall()}
+
     return internal_user_ids, internal_emails
 
 
