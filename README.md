@@ -526,16 +526,28 @@ day's registration write ever runs.
 ## Brief format and prioritization
 
 The daily brief follows a fixed template (`app/brief.py`'s `SYSTEM_PROMPT`): 📊 AT A
-GLANCE → 🎯 #1 PRIORITY → 🔥 QUICK WINS (up to 3) → 📣 CONTENT OPPORTUNITIES (LinkedIn/
-Facebook/Instagram) → 🔎 SEO OPPORTUNITIES → 🤖 GEO/AI SEARCH OPPORTUNITIES → 👤 LEAD
-OUTREACH (up to 3, each with a full draft message) → 💬 COMMUNITY OPPORTUNITIES (Reddit
-only - see below) → 🧪 EXPERIMENT (at most one) → 🧠 WHAT WE'RE LEARNING (FACT/SIGNAL/
-HYPOTHESIS-labeled) → ⚠️ WATCH → 🏁 BOTTOM LINE, each section (and named
-platform/subsection within one, e.g. one of the three Content Opportunities platforms)
-omitted entirely when there's nothing meaningful. This is intentionally a full report,
-not a phone-scan summary - there is no target word count; `WORD_COUNT_WARN_THRESHOLD`
-(1800 words) in `generate_brief()` is a runaway-generation safety net only, not a
-brevity target.
+GLANCE → 📆 YESTERDAY → 🎯 #1 PRIORITY → 🔥 QUICK WINS (up to 3) → 📣 CONTENT
+OPPORTUNITIES (LinkedIn/Facebook/Instagram, each with a structured Hook/Post/CTA-style
+draft) → 🔎 SEO OPPORTUNITIES (each with its own displayed Impact/Confidence/Ease/Score)
+→ 🤖 GEO/AI SEARCH OPPORTUNITIES → 👤 LEAD OUTREACH (up to 3, each with a full draft
+message) → 💬 COMMUNITY OPPORTUNITIES (Reddit only - see below) → 🧪 EXPERIMENT (at most
+one) → 🧠 WHAT WE'RE LEARNING (FACT/SIGNAL/HYPOTHESIS-labeled) → ⚠️ WATCH → 🏁 BOTTOM
+LINE, each section (and named platform/subsection within one, e.g. one of the three
+Content Opportunities platforms) omitted entirely when there's nothing meaningful. The
+prompt targets ~500-800 words for the whole email (a return to an explicit target, after
+an earlier version of this brief dropped it as incompatible with the bigger template -
+see [[growth-agent-brief-format-rewrite]] in project memory); `WORD_COUNT_WARN_THRESHOLD`
+(1200 words) in `generate_brief()` is a loose ceiling above that target, not the target
+itself - it only warns on a genuinely runaway/looping completion, never blocks the send.
+
+**The brief is explicitly told not to default to SEO as the #1 Priority** just because a
+search-console number looks low - low traffic is very often not DataLayer's actual
+bottleneck at its current volume. Before picking SEO as #1, the prompt requires weighing
+it against every other channel with real evidence that run (leads, activation,
+conversion, free-tool optimization, GEO, social, Reddit, direct outreach,
+pricing/onboarding). A `FINAL QUALITY CHECK` block (a checklist the LLM is told to run
+silently against its own draft before responding, never rendered in the output) reinforces
+this and the internal-exclusion rules right before generation.
 
 **Impact x Confidence x Ease scores ARE displayed** — for 🎯 #1 PRIORITY (`Impact: N/5` /
 `Confidence: N/5` / `Ease: N/5` / `Score: N/125`, colon-separated) and for each 🔥 QUICK
@@ -645,7 +657,11 @@ For items marked `done`, the brief's 🧠 WHAT WE'RE LEARNING section (only when
 an eligible entry — most runs there isn't, which is normal) shows DataLayer's own
 signup/upload counts in the days immediately before vs. after the item was resolved,
 always labeled SIGNAL (never FACT - the sample is always too small; see the
-FACT/SIGNAL/HYPOTHESIS evidence discipline the whole brief uses)
+FACT/SIGNAL/HYPOTHESIS evidence discipline the whole brief uses), prefixed with a
+directional badge - 🟡 INCONCLUSIVE when `low_signal` is true, 🟢 WORKING when
+signups/uploads moved up, 🔴 NOT WORKING when neither did. The badge is a prioritization
+aid ("try this again" vs. "drop it"), not a causal claim - the prompt requires it always
+be immediately followed by the no-control-group caveat sentence, never shown alone
 (`app/metrics.py`'s `_resolved_action_outcomes`/`_anchored_window_counts`/
 `_totals_before_after`, `app/tracking.py`'s `get_resolved_items_for_attribution`).
 `skipped` items are excluded (nothing was executed, so a delta isn't meaningful).
