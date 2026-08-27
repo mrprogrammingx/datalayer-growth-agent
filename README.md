@@ -258,12 +258,18 @@ Fill in:
   sender
 - `GROWTH_BRIEF_RECIPIENT`
 - `BRIEF_SEND_HOUR_UTC` (default `8`)
+- `ACQUISITION_REPORT_SEND_HOUR_UTC` (default `8`) — see "Automated customer acquisition
+  reporting" below
 - `WEEKLY_REPORT_SEND_DAY_UTC` (default `mon`), `WEEKLY_REPORT_SEND_HOUR_UTC` (default
   `9`) — see "Automated weekly reporting" below
 - `GROWTH_AGENT_NETWORK` — see step 6
 - `GOOGLE_OAUTH_CLIENT_ID`, `GOOGLE_OAUTH_CLIENT_SECRET`, `GOOGLE_OAUTH_REFRESH_TOKEN`,
   `GA4_PROPERTY_ID`, `SEARCH_CONSOLE_SITE_URL` — from step 3
 - `REDDIT_CLIENT_ID`, `REDDIT_CLIENT_SECRET`, `REDDIT_USER_AGENT` — from step 4
+- `APIFY_API_TOKEN` (from Apify Console > Settings > Integrations), `APIFY_PROSPECT_QUERY`
+  (optional niche keyword, empty = broad discovery) — powers the customer acquisition
+  report's PROSPECTING section; optional, degrades gracefully if unset (see
+  "Automated customer acquisition reporting" below)
 
 ## 6. Confirm the Docker network name
 
@@ -289,11 +295,13 @@ docker network ls | grep datalayer
 docker compose up -d --build
 ```
 
-This boots the Flask app (internal-only, no published port) and starts both APScheduler
-jobs: the daily brief (default 08:00 UTC, configurable via `BRIEF_SEND_HOUR_UTC`) and
-the weekly report (default Monday 09:00 UTC, configurable via
-`WEEKLY_REPORT_SEND_DAY_UTC`/`WEEKLY_REPORT_SEND_HOUR_UTC`) — both emails send on
-report day, the weekly report does not replace that day's daily brief.
+This boots the Flask app (internal-only, no published port) and starts all three
+APScheduler jobs: the daily growth brief (default 08:00 UTC, configurable via
+`BRIEF_SEND_HOUR_UTC`), the daily customer acquisition report (default 08:30 UTC,
+configurable via `ACQUISITION_REPORT_SEND_HOUR_UTC` — fires 30 minutes after the growth
+brief's hour so the two LLM calls don't race each other), and the weekly report (default
+Monday 09:00 UTC, configurable via `WEEKLY_REPORT_SEND_DAY_UTC`/
+`WEEKLY_REPORT_SEND_HOUR_UTC`) — all three are separate emails; none replaces another.
 
 Gunicorn runs with `--timeout 120` (not the 5-workers/no-timeout default) — a real
 `/run-now` was observed crashing the worker (`SIGABRT`→`SIGKILL`) on gunicorn's default
@@ -301,14 +309,14 @@ Gunicorn runs with `--timeout 120` (not the 5-workers/no-timeout default) — a 
 occasionally took longer than that. Confirmed live: the email had actually already sent
 successfully by the time the worker was killed, so the failure mode is a false-negative
 500 response, not a lost brief — but still worth the fix so `/run-now`/
-`/weekly-report-now` return correctly instead of crashing.
+`/acquisition-report-now`/`/weekly-report-now` return correctly instead of crashing.
 
-## 8. Verify GA4/Search Console/Reddit credentials before testing the full brief
+## 8. Verify GA4/Search Console/Reddit/Apify credentials before testing the full brief
 
-Before triggering a real (billed) `/run-now`, confirm the GA4, Search Console, and
-Reddit credentials/permissions work using the three debug-only routes — these call the
-fetch functions directly and return raw JSON, without touching the LLM or sending any
-email:
+Before triggering a real (billed) `/run-now` or `/acquisition-report-now`, confirm the
+GA4, Search Console, Reddit, and Apify credentials/permissions work using the four
+debug-only routes — these call the fetch functions directly and return raw JSON, without
+touching the LLM or sending any email:
 
 ```bash
 docker compose exec growth-agent python -c "
@@ -323,7 +331,15 @@ docker compose exec growth-agent python -c "
 import urllib.request
 print(urllib.request.urlopen('http://localhost:8080/debug/reddit').read().decode())
 "
+docker compose exec growth-agent python -c "
+import urllib.request
+print(urllib.request.urlopen('http://localhost:8080/debug/apify').read().decode())
+"
 ```
+
+`/debug/apify` runs the real Apify Actor with `maxItems=3` — a small, cheap credential
+check, not a free call (Apify bills by compute usage, unlike the other three debug
+routes).
 
 If either GA4/Search Console call returns an error, double check: `GOOGLE_OAUTH_CLIENT_ID`/
 `GOOGLE_OAUTH_CLIENT_SECRET`/`GOOGLE_OAUTH_REFRESH_TOKEN` are all set in `.env` (from
@@ -337,6 +353,12 @@ If `/debug/reddit` returns an error, double check `REDDIT_CLIENT_ID`/
 `REDDIT_CLIENT_SECRET`/`REDDIT_USER_AGENT` are set in `.env` (from step 4). A clean
 empty list (`[]`) is a valid response — it means no posts matched the curated
 subreddits/keywords in the last couple of days, not a credentials problem.
+
+If `/debug/apify` returns an error, double check `APIFY_API_TOKEN` is set in `.env` and
+is a valid, unexpired token from Apify Console > Settings > Integrations, and that your
+Apify account has enough credit/compute quota to run an Actor. A clean empty list (`[]`)
+is a valid response — it means the Actor found no matching stores this run, not a
+credentials problem.
 
 Only once all three debug routes return real, clean data (or a clean empty list for
 Reddit) should you move on to a full end-to-end test.
@@ -368,6 +390,17 @@ Or check health:
 docker compose exec growth-agent python -c "
 import urllib.request
 print(urllib.request.urlopen('http://localhost:8080/health').read().decode())
+"
+```
+
+`/acquisition-report-now` tests the customer acquisition report the same way — it also
+triggers a real (billed) OpenRouter call and a real email send, same caution as `/run-now`:
+
+```bash
+docker compose exec growth-agent python -c "
+import urllib.request
+req = urllib.request.Request('http://localhost:8080/acquisition-report-now', method='POST')
+print(urllib.request.urlopen(req).read().decode())
 "
 ```
 
@@ -431,13 +464,15 @@ scripts/
                        the Docker image)
 app/
   main.py             Flask app: GET /health, GET /debug/ga4, GET /debug/search-console,
-                       GET /debug/reddit, POST /run-now, POST /weekly-report-now
-  scheduler.py        Two APScheduler jobs: daily brief (default 08:00 UTC) and
+                       GET /debug/reddit, GET /debug/apify, POST /run-now,
+                       POST /acquisition-report-now, POST /weekly-report-now
+  scheduler.py        Three APScheduler jobs: daily growth brief (default 08:00 UTC),
+                       daily customer acquisition report (default 08:30 UTC), and
                        weekly report (default Monday 09:00 UTC)
   db.py               Read-only Postgres connection
   tracking.py         Write-scoped Postgres connection (separate role) for
                        action/experiment tracking AND lead-outreach status - the only
-                       module that ever writes
+                       module that ever writes; shared by both daily LLM reports
   metrics.py          Signup/upload/lead queries + GA4/Search Console/Reddit/pending-
                        tracking/attribution/lead-exclusion merge -> plain JSON; also
                        the weekly week-over-week metrics + shared attribution helper
@@ -446,27 +481,38 @@ app/
   search_console.py   Search Console API: top queries/pages by clicks
   reddit_discovery.py Reddit API (read-only): recent posts in curated subreddits
                        matching curated keywords
-  brief.py            Builds LLM prompt, calls OpenAI, returns (markdown brief,
-                       trackable action/experiment items)
+  brief.py            Builds the Growth Brief LLM prompt, calls OpenAI, returns
+                       (markdown brief, trackable action/experiment items)
+  acquisition_report.py
+                       Builds the Customer Acquisition Report LLM prompt (existing
+                       leads, community, prospecting, daily target) - a separate email
+                       from the Growth Brief, reuses brief.py's OpenRouter config and
+                       tracking-JSON extraction; collect_acquisition_data() layers
+                       apify_prospecting.py on top of metrics.collect_metrics()
+  apify_prospecting.py Apify REST API: runs the "Shopify Store Finder" Actor to find
+                       real, live Shopify storefronts for the acquisition report's
+                       PROSPECTING section
   weekly_report.py    Deterministic weekly rollup - NO LLM call, plain-text formatter
-  email_sender.py     Sends an email via Resend (daily brief or weekly report)
+  email_sender.py     Sends an email via Resend (growth brief, acquisition report, or
+                       weekly report)
 ```
 
 ## Data sources
 
 DataLayer's own Postgres (signups, uploads, free-tool leads, unconverted free-tool
 leads for outreach research), GA4 (traffic, per-tool-page sessions, funnel event
-counts), Search Console (top search queries/pages), and Reddit (recent posts in a
-curated list of subreddits matching curated keywords) are all wired in. If a GA4,
-Search Console, or Reddit fetch fails on a given run, that run's brief still sends —
-the failure is reported under `data_gaps` in the metrics JSON instead of crashing the
-whole pipeline, since the DB-only brief is still valuable on its own. DB, LLM, and
-email failures are NOT handled this way — they still fail loudly, since there's no
-meaningful fallback for those.
+counts), Search Console (top search queries/pages), Reddit (recent posts in a
+curated list of subreddits matching curated keywords), and Apify (real, live Shopify
+storefronts for the acquisition report's PROSPECTING section — see
+`app/apify_prospecting.py`) are all wired in. If a GA4, Search Console, Reddit, or Apify
+fetch fails on a given run, that run's report still sends — the failure is reported under
+`data_gaps` in the metrics JSON instead of crashing the whole pipeline, since the rest of
+the report is still valuable on its own. DB, LLM, and email failures are NOT handled this
+way — they still fail loudly, since there's no meaningful fallback for those.
 
-Every Reddit reply and lead-outreach message the brief drafts is explicitly labeled a
-draft for human review — this system never posts to Reddit/LinkedIn/Facebook or sends
-outreach on its own.
+Every Reddit reply, lead-outreach message, and prospect outreach draft is explicitly
+labeled a draft for human review — this system never posts to Reddit/LinkedIn/Facebook or
+sends outreach on its own.
 
 ## Action/experiment tracking
 
@@ -699,6 +745,52 @@ Like `pending_from_prior_briefs`, this degrades gracefully (`data_gaps`) if
 `GROWTH_AGENT_TRACKING_DATABASE_URL` is unset or unreachable — no new env var, no new
 debug route (it's an internal DB-to-DB computation, no external credential to
 pre-verify).
+
+## Automated customer acquisition reporting
+
+Every day (default 08:30 UTC, 30 minutes after the growth brief's hour, configurable via
+`ACQUISITION_REPORT_SEND_HOUR_UTC`), a second, separate daily email sends the Customer
+Acquisition Report (`app/acquisition_report.py`) — its own LLM call, its own email, sent
+*in addition to* that day's growth brief, not instead of it.
+
+Why a separate report rather than a new section in the growth brief: the growth brief's
+job is broad ("analyze all the metrics, find the biggest bottleneck" — traffic, SEO, GEO,
+content, ICE-scored quick wins). This report has one narrow, harder-nosed job: DataLayer
+has 0 external paying customers, so every day it only asks "what gets us closer to the
+first 10 real ones, today." It deliberately excludes AT A GLANCE, Quick Wins, SEO/GEO, and
+Content Opportunities — those stay exclusively in the growth brief — so the two emails
+don't repeat each other in different words.
+
+Sections (each omitted when there's nothing real to report, except Lead-Based Outreach
+and Prospecting, which always show — see `acquisition_report.py`'s SYSTEM_PROMPT for the
+exact fallback lines):
+- **Today's prioritized actions** — up to 3, ranked existing leads > community >
+  outreach > partnerships > content > SEO, each tied to real evidence in this run's data.
+- **Lead-based outreach** — the same `lead_research` candidates the growth brief's Lead
+  Outreach section draws from (DataLayer currently has no other named-individual,
+  external-intent data source), with draft messages for human review only.
+- **Prospecting** — up to 5 real, live Shopify storefronts via the Apify "Shopify Store
+  Finder" Actor (`app/apify_prospecting.py`, `igolaizola/shopify-store-finder`), each with
+  business/website/contact-channel/why-they-fit/evidence and a draft outreach message.
+  Optional — degrades gracefully (see `data_gaps`) if `APIFY_API_TOKEN` is unset or the
+  Apify run fails, same philosophy as GA4/Search Console/Reddit. Unlike `lead_research`,
+  a prospect's contact email is public information the merchant already publishes on
+  their own storefront, so (unlike Lead-Based Outreach) it's fine for it to appear in the
+  report. Prospects and leads share the same `growth_agent_lead_outreach`
+  contacted/skipped tracking (`scripts/mark_lead.py`) — mark a prospect contacted or
+  skipped and it stops resurfacing here.
+- **Community opportunities** — Reddit only, same data source and draft-for-review
+  convention as the growth brief's Community Opportunities section.
+- **Customer experiment** — at most one, same shape as the growth brief's Experiment
+  section, shares the same `growth_agent_tracked_items` table (see below).
+- **Customer acquisition target** — a short, concrete daily target derived only from what
+  this run's data actually supports (never an invented headline number).
+
+Shares the growth brief's tracking table on purpose: both reports write their action/
+experiment items to the same `growth_agent_tracked_items` table via `tracking.py`, and
+both read `pending_from_prior_briefs` from it. This means an action recommended by one
+report is visible to the other, so the two don't independently recommend the same
+unresolved thing forever.
 
 ## Automated weekly reporting
 

@@ -2,18 +2,24 @@
 trigger routes.
 
 Not routed through nginx and has no published port in docker-compose.yml -
-/run-now and /weekly-report-now both send real emails (/run-now also makes
-a real, billed OpenAI call), so this must never be publicly reachable. Use
-`docker exec` or curl from inside the Docker network to hit it for manual
-testing.
+/run-now, /acquisition-report-now, and /weekly-report-now all send real
+emails (/run-now and /acquisition-report-now also make a real, billed
+OpenAI call), so this must never be publicly reachable. Use `docker exec`
+or curl from inside the Docker network to hit it for manual testing.
 """
 import logging
 
 from flask import Flask, jsonify
 
+from .apify_prospecting import fetch_shopify_prospects
 from .ga4 import fetch_ga4_metrics
 from .reddit_discovery import fetch_reddit_discussions
-from .scheduler import start_scheduler, run_growth_brief_job, run_weekly_report_job
+from .scheduler import (
+    start_scheduler,
+    run_acquisition_report_job,
+    run_growth_brief_job,
+    run_weekly_report_job,
+)
 from .search_console import fetch_search_console_metrics
 
 logging.basicConfig(level=logging.INFO)
@@ -67,6 +73,22 @@ def debug_reddit():
         return jsonify({'status': 'error', 'error': str(exc)}), 500
 
 
+@app.get('/debug/apify')
+def debug_apify():
+    """Calls fetch_shopify_prospects() directly and returns the raw JSON -
+    no LLM call, no email send. Uses a small max_items (3) - this is a
+    credential/wiring check, not a real prospecting run, and Apify Actor
+    runs are billed by compute usage. Use this to verify APIFY_API_TOKEN
+    without triggering a real (billed, on both OpenRouter and Apify)
+    /acquisition-report-now.
+    """
+    try:
+        return jsonify(fetch_shopify_prospects(max_items=3))
+    except Exception as exc:
+        logging.exception('debug/apify failed')
+        return jsonify({'status': 'error', 'error': str(exc)}), 500
+
+
 @app.post('/run-now')
 def run_now():
     """Manual trigger for testing. Makes a real OpenAI API call and sends a
@@ -78,6 +100,20 @@ def run_now():
         return jsonify({'status': 'sent', 'brief': brief_markdown})
     except Exception as exc:
         logging.exception('run-now failed')
+        return jsonify({'status': 'error', 'error': str(exc)}), 500
+
+
+@app.post('/acquisition-report-now')
+def acquisition_report_now():
+    """Manual trigger for testing. Makes a real OpenAI API call and sends a
+    real email via Resend - internal-only, no nginx route, not for
+    unattended/public use. Same caution as /run-now.
+    """
+    try:
+        report_markdown = run_acquisition_report_job()
+        return jsonify({'status': 'sent', 'report': report_markdown})
+    except Exception as exc:
+        logging.exception('acquisition-report-now failed')
         return jsonify({'status': 'error', 'error': str(exc)}), 500
 
 
