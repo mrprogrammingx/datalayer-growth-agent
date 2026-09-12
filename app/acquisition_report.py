@@ -36,7 +36,7 @@ from typing import Any, Dict, List, Optional
 from openai import OpenAI
 
 from .apify_prospecting import fetch_shopify_prospects, normalize_prospect_domain
-from .brief import MODEL, OPENROUTER_BASE_URL, _extract_trackable_items
+from .brief import MODEL, OPENROUTER_BASE_URL, TRAILING_JSON_BLOCK_RE, _extract_trackable_items
 from .metrics import collect_metrics
 from .tracking import get_excluded_prospect_domains
 
@@ -225,11 +225,13 @@ to this report:
   null - not every storefront publishes one), country, currency, product_count_range (a
   MIN-MAX string from the store's own catalog, e.g. "12-40" - a rough size proxy only,
   NOT a verified employee/revenue count), theme, description, and domain (the dedup key -
-  surface it ONLY on the PROSPECT block's own Domain: line below, verbatim, so it can be
-  pasted into internal suppression tooling; never weave it into prose or a draft
-  message). UNLIKE lead_research, this data is public business contact info a merchant
-  already publishes on their own storefront (not DataLayer's own captured user data) - it
-  is fine to include a prospect's business email in this report, since the report's
+  surface it on the PROSPECT block's own Domain: line below, verbatim, AND as that same
+  block's "domain" value in the trailing JSON block (see OUTPUT FORMAT), so it can be
+  pasted into internal suppression tooling and matched back to this exact prospect
+  programmatically; never weave it into prose or a draft message). UNLIKE lead_research,
+  this data is public business contact info a merchant already publishes on their own
+  storefront (not DataLayer's own captured user data) - it is fine to include a
+  prospect's business email in this report, since the report's
   purpose is making outreach to it actionable. Judge genuine fit from product_count_range
   (a very large range suggests an established store that likely already has BI/ops
   tooling, not DataLayer's ICP), country/currency, and the description - never assume fit
@@ -404,15 +406,24 @@ default to a generic number.]
 ━━━━━━━━━━━━━━━━━━━━
 
 ```json
-[{"category": "action", "description": "..."}, {"category": "experiment", "description": "..."}]
+[{"category": "action", "description": "..."}, {"category": "experiment", "description": "..."}, {"domain": "...", "draft_message": "..."}]
 ```
 
 The fenced json block above is REQUIRED, must be the very last thing in your response, and
-is internal plumbing only - never mention it in the visible report. One object per action
-shown under TODAY'S PRIORITIZED ACTIONS (category "action"), and one object for CUSTOMER
-EXPERIMENT if you included one (category "experiment") - nothing else, no items for Lead
-Outreach, Prospecting, or Community. If you cannot produce it for any reason, omit the
-whole block rather than emitting malformed JSON.
+is internal plumbing only - never mention it in the visible report. It must contain, in any
+order:
+- one object per action shown under TODAY'S PRIORITIZED ACTIONS (category "action")
+- one object for CUSTOMER EXPERIMENT if you included one (category "experiment")
+- one {"domain": "...", "draft_message": "..."} object per \U0001f52d PROSPECT block you
+  actually rendered under PROSPECTING (one per prospect shown, never for a lead) -
+  "domain" must be copied EXACTLY from that same block's own Domain: line, and
+  "draft_message" must be that same block's own DRAFT MESSAGE Subject line and body,
+  verbatim, as one string. Skip this object entirely for a prospect whose Domain: line is
+  "(none)" - a draft that can't be matched back to a real domain isn't trackable and must
+  never be paired with a different prospect's domain instead.
+Nothing else belongs in this array - no items for Lead Outreach or Community. If you
+cannot produce it for any reason, omit the whole block rather than emitting malformed
+JSON.
 """
 
 
@@ -530,6 +541,69 @@ def _clean_optional_sections(markdown: str, reddit_discussions) -> str:
     return markdown
 
 
+def _extract_prospect_drafts(raw_content: str) -> Dict[str, str]:
+    """Pulls {"domain": ..., "draft_message": ...} entries back out of the
+    SAME trailing ```json fence _extract_trackable_items reads (see
+    brief.py) - a sibling extractor rather than an extension of that shared
+    function, since brief.py's growth brief never has prospect drafts and an
+    entry here is told apart from an action/experiment item by the presence
+    of a "domain" key, not a "category" one.
+
+    Never raises - a missing/malformed block, or the whole array not being
+    a list, degrades to an empty dict, same graceful-degradation contract
+    as _extract_trackable_items. A prospect's draft failing to extract must
+    never block the (already rendered) email.
+    """
+    matches = list(TRAILING_JSON_BLOCK_RE.finditer(raw_content))
+    if not matches:
+        return {}
+    try:
+        parsed = json.loads(matches[-1].group(1))
+    except json.JSONDecodeError:
+        return {}
+    if not isinstance(parsed, list):
+        return {}
+
+    drafts: Dict[str, str] = {}
+    for entry in parsed:
+        if not isinstance(entry, dict) or 'domain' not in entry:
+            continue  # an action/experiment item - _extract_trackable_items' territory
+        domain = entry.get('domain')
+        draft_message = entry.get('draft_message')
+        if (
+            isinstance(domain, str) and domain.strip()
+            and isinstance(draft_message, str) and draft_message.strip()
+        ):
+            drafts[domain.strip()] = draft_message.strip()
+        else:
+            LOGGER.warning('Skipping malformed prospect-draft entry: %r', entry)
+    return drafts
+
+
+def _attach_prospect_drafts(prospects: Optional[List[Dict[str, Any]]], raw_content: str) -> None:
+    """Matches _extract_prospect_drafts(raw_content)'s {domain: draft_message}
+    map back onto `prospects` (metrics['prospects']), mutated in place so the
+    exact same dicts scheduler.py later hands to mark_prospects_surfaced()
+    carry the match - domain is the only identity both sides share, since the
+    LLM never sees a prospect's row id or list position.
+
+    A prospect the LLM omitted as a non-fit, whose Domain: line didn't
+    round-trip cleanly, or that the trailing JSON block simply has no entry
+    for, just keeps no draft_message - logged, never raised, same
+    non-blocking degradation as everywhere else in this module.
+    """
+    if not prospects:
+        return
+    drafts = _extract_prospect_drafts(raw_content)
+    for prospect in prospects:
+        domain = prospect.get('domain')
+        draft_message = drafts.get(domain) if domain else None
+        if draft_message:
+            prospect['draft_message'] = draft_message
+        else:
+            LOGGER.info('No draft message extracted for prospect domain %r this run', domain)
+
+
 def generate_acquisition_report(metrics: dict):
     """Calls the OpenAI API once and returns (report_markdown, trackable_items).
 
@@ -541,6 +615,12 @@ def generate_acquisition_report(metrics: dict):
     the trailing JSON block, trackable_items is always a list (empty on any
     extraction failure), and this raises on any API error since a silently
     failed report means no email gets sent and nobody would know why.
+
+    Side effect: mutates metrics['prospects'] in place, attaching each
+    matched draft_message (see _attach_prospect_drafts) - scheduler.py reads
+    that same metrics['prospects'] afterward to call
+    mark_prospects_surfaced(), so nothing else has to thread the drafts
+    through separately.
     """
     api_key = os.environ.get('OPENROUTER_API_KEY')
     if not api_key:
@@ -563,6 +643,7 @@ def generate_acquisition_report(metrics: dict):
 
     report_markdown, trackable_items = _extract_trackable_items(raw)
     report_markdown = _clean_optional_sections(report_markdown, metrics.get('reddit_discussions'))
+    _attach_prospect_drafts(metrics.get('prospects'), raw)
 
     word_count = len(report_markdown.split())
     if word_count > WORD_COUNT_WARN_THRESHOLD:

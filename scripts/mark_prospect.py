@@ -51,6 +51,11 @@ def _cmd_list():
             f"{p['domain']} — {business} "
             f"({p['status']}, surfaced {p['times_surfaced']}x, last {last})"
         )
+        if p.get('draft_message'):
+            indented = '\n'.join(f'    {line}' for line in p['draft_message'].splitlines())
+            print(f'  Draft message:\n{indented}')
+        else:
+            print('  Draft message: (none captured)')
 
 
 def _cmd_mark(domain_arg: str, status: str, note: str):

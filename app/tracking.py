@@ -366,6 +366,17 @@ def mark_prospects_surfaced(prospects: List[Dict[str, Any]]) -> int:
     business/website/email on conflict, and never resets a row already
     marked 'contacted'/'skipped' back to 'surfaced'.
 
+    draft_message is the deliberate exception to "never overwrites": unlike
+    business/website/email (static storefront facts), the LLM redrafts a
+    prospect's outreach message fresh every time it resurfaces, so a draft
+    from weeks ago is not just stale but actively wrong to keep showing as
+    current. It IS overwritten on every conflict where this run actually
+    produced one - via COALESCE(EXCLUDED.draft_message, ...) it only falls
+    back to the existing stored value when this run's dict has none (e.g.
+    acquisition_report._attach_prospect_drafts found no match this run),
+    so an extraction miss degrades to "keep the old draft", never to
+    silently wiping a good one.
+
     Raises on any error - scheduler.py catches, logs the greppable
     'TRACKING WRITE FAILED:' prefix, and never lets it block the (already
     sent) email. Returns the number of rows inserted or updated.
@@ -383,15 +394,22 @@ def mark_prospects_surfaced(prospects: List[Dict[str, Any]]) -> int:
             cur.execute(
                 """
                 INSERT INTO growth_agent_prospects
-                    (domain, business, website, email, status, times_surfaced, last_surfaced_at)
-                VALUES (%s, %s, %s, %s, 'surfaced', 1, now())
+                    (domain, business, website, email, draft_message, status, times_surfaced, last_surfaced_at)
+                VALUES (%s, %s, %s, %s, %s, 'surfaced', 1, now())
                 ON CONFLICT (domain) DO UPDATE
                 SET last_surfaced_at = now(),
                     times_surfaced   = growth_agent_prospects.times_surfaced + 1,
+                    draft_message    = COALESCE(EXCLUDED.draft_message, growth_agent_prospects.draft_message),
                     status = CASE WHEN growth_agent_prospects.status IN ('contacted', 'skipped')
                                   THEN growth_agent_prospects.status ELSE 'surfaced' END
                 """,
-                (domain, prospect.get('business'), prospect.get('website'), prospect.get('email')),
+                (
+                    domain,
+                    prospect.get('business'),
+                    prospect.get('website'),
+                    prospect.get('email'),
+                    prospect.get('draft_message'),
+                ),
             )
             affected += cur.rowcount
         return affected
@@ -403,11 +421,15 @@ def get_reviewable_prospects(limit: int = 50) -> List[Dict[str, Any]]:
     first. A convenience, not a hard requirement: the domain is printed
     directly in the report, so a prospect can be marked without looking
     anything up first.
+
+    Includes draft_message so a prospect can be reviewed and marked
+    contacted/skipped straight from this CLI, without digging back through
+    old report emails to find what was actually drafted for it.
     """
     with _cursor() as cur:
         cur.execute(
             """
-            SELECT domain, business, status, times_surfaced, last_surfaced_at, first_seen_at
+            SELECT domain, business, status, times_surfaced, last_surfaced_at, first_seen_at, draft_message
             FROM growth_agent_prospects
             WHERE status = 'surfaced'
             ORDER BY last_surfaced_at DESC NULLS LAST, first_seen_at DESC
@@ -423,6 +445,7 @@ def get_reviewable_prospects(limit: int = 50) -> List[Dict[str, Any]]:
                 'times_surfaced': r[3],
                 'last_surfaced_at': r[4].isoformat() if r[4] else None,
                 'first_seen_at': r[5].isoformat() if r[5] else None,
+                'draft_message': r[6],
             }
             for r in cur.fetchall()
         ]

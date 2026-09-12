@@ -114,6 +114,21 @@ not wired into either repo's Alembic migration chain (see below), so a DB restor
 predates these tables won't bring them back on its own — re-run `sql/schema.sql` after
 such a restore. Same exposure `growth_agent_ro` already has today.
 
+**One-time manual step for hosts that already have `growth_agent_prospects`**:
+`sql/schema.sql`'s `CREATE TABLE IF NOT EXISTS` is a no-op on a table that already
+exists, so it will never add the `draft_message` column to a `growth_agent_prospects`
+table created before this column existed (see the file's own "NOT A MIGRATION TOOL"
+note). On any such host, run once:
+
+```bash
+docker compose -f ../datalayer-ecommerce/docker-compose.yml exec -T db \
+  psql -v ON_ERROR_STOP=1 -U datalayer -d datalayer -c \
+  'ALTER TABLE growth_agent_prospects ADD COLUMN IF NOT EXISTS draft_message TEXT;'
+```
+
+A fresh host that runs `sql/schema.sql` for the first time gets this column
+automatically and needs no separate step.
+
 *(Why not an Alembic migration in `datalayer-ecommerce` instead? That repo's migration
 chain never issues GRANT/CREATE ROLE either — it's always a manual step, exactly like
 `growth_agent_ro`'s own setup above. Coupling this schema to the main app's migration

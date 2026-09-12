@@ -25,6 +25,13 @@
 -- an existing one. A schema change to any of these tables is a manual ALTER run against
 -- each host, followed by updating this file to match. This is deliberately not wired
 -- into either repo's Alembic migration chain - see README "why not an Alembic migration".
+--
+-- EXAMPLE (one-time, existing hosts only): growth_agent_prospects.draft_message was
+-- added after this table may already exist on a host. A fresh host gets it for free via
+-- the CREATE TABLE IF NOT EXISTS below; a host with the table already created needs one
+-- manual run of:
+--   ALTER TABLE growth_agent_prospects ADD COLUMN IF NOT EXISTS draft_message TEXT;
+-- (see README section 2 for the exact docker-wrapped psql invocation).
 
 BEGIN;
 
@@ -58,6 +65,7 @@ CREATE TABLE IF NOT EXISTS growth_agent_prospects (
     business VARCHAR,
     website VARCHAR,
     email VARCHAR,
+    draft_message TEXT,                          -- LLM-drafted outreach text, redrafted (overwritten) every resurfacing
     status VARCHAR NOT NULL DEFAULT 'surfaced',  -- 'surfaced' | 'contacted' | 'skipped'
     times_surfaced INTEGER NOT NULL DEFAULT 0,
     first_seen_at TIMESTAMP NOT NULL DEFAULT now(),
