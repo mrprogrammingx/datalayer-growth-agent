@@ -40,8 +40,8 @@ def _connect():
     role. NOT session-readonly, unlike db.py's connect_to_db() - this is
     the one connection in the app allowed to write, scoped by GRANT to
     SELECT/INSERT/UPDATE on only growth_agent_tracked_items/
-    growth_agent_lead_outreach. Caller must close it - prefer the _cursor()
-    context manager below over calling this directly.
+    growth_agent_lead_outreach/growth_agent_prospects. Caller must close it -
+    prefer the _cursor() context manager below over calling this directly.
     """
     conn = psycopg2.connect(**psycopg2_connect_kwargs(_get_tracking_database_url()))
     conn.autocommit = False
@@ -323,6 +323,134 @@ def get_pending_leads(limit: int = 50) -> List[Dict[str, Any]]:
             (limit,),
         )
         return [{'email': r[0], 'first_seen_at': r[1].isoformat()} for r in cur.fetchall()]
+
+
+def get_excluded_prospect_domains(cooldown_days: int) -> set:
+    """Normalized storefront domains that must NOT be surfaced in the
+    customer acquisition report this run: any already marked 'contacted' or
+    'skipped' (permanent), plus any surfaced within the last `cooldown_days`
+    days (temporary - ages out on its own once last_surfaced_at falls
+    outside the window).
+
+    The interval is computed in SQL (now() - make_interval(...)), consistent
+    with get_resolved_items_for_attribution, to avoid app-server/DB clock
+    skew.
+
+    Raises on any error; acquisition_report.py must catch and fall back to
+    the UNFILTERED prospect list (never hide every prospect because the
+    filter itself broke), same pattern as get_excluded_lead_emails.
+    """
+    with _cursor() as cur:
+        cur.execute(
+            """
+            SELECT domain FROM growth_agent_prospects
+            WHERE status IN ('contacted', 'skipped')
+               OR (last_surfaced_at IS NOT NULL
+                   AND last_surfaced_at > now() - make_interval(days => %s))
+            """,
+            (cooldown_days,),
+        )
+        return {row[0] for row in cur.fetchall()}
+
+
+def mark_prospects_surfaced(prospects: List[Dict[str, Any]]) -> int:
+    """One idempotent upsert per prospect actually surfaced in today's
+    acquisition report - bumps times_surfaced and sets last_surfaced_at to
+    now(), which is what starts the cooldown window in
+    get_excluded_prospect_domains.
+
+    Each dict must already carry a normalized 'domain' (the caller's job -
+    see acquisition_report._select_prospects_to_surface); entries with a
+    falsy domain are dropped, and the input is de-duped on domain first so
+    one run can't double-bump a single row. Never overwrites the first-seen
+    business/website/email on conflict, and never resets a row already
+    marked 'contacted'/'skipped' back to 'surfaced'.
+
+    Raises on any error - scheduler.py catches, logs the greppable
+    'TRACKING WRITE FAILED:' prefix, and never lets it block the (already
+    sent) email. Returns the number of rows inserted or updated.
+    """
+    by_domain: Dict[str, Dict[str, Any]] = {}
+    for prospect in prospects:
+        domain = prospect.get('domain')
+        if domain:
+            by_domain.setdefault(domain, prospect)
+    if not by_domain:
+        return 0
+    with _cursor(commit=True) as cur:
+        affected = 0
+        for domain, prospect in by_domain.items():
+            cur.execute(
+                """
+                INSERT INTO growth_agent_prospects
+                    (domain, business, website, email, status, times_surfaced, last_surfaced_at)
+                VALUES (%s, %s, %s, %s, 'surfaced', 1, now())
+                ON CONFLICT (domain) DO UPDATE
+                SET last_surfaced_at = now(),
+                    times_surfaced   = growth_agent_prospects.times_surfaced + 1,
+                    status = CASE WHEN growth_agent_prospects.status IN ('contacted', 'skipped')
+                                  THEN growth_agent_prospects.status ELSE 'surfaced' END
+                """,
+                (domain, prospect.get('business'), prospect.get('website'), prospect.get('email')),
+            )
+            affected += cur.rowcount
+        return affected
+
+
+def get_reviewable_prospects(limit: int = 50) -> List[Dict[str, Any]]:
+    """For scripts/mark_prospect.py's `list` command - prospects still in
+    'surfaced' state (not yet contacted/skipped), most-recently-surfaced
+    first. A convenience, not a hard requirement: the domain is printed
+    directly in the report, so a prospect can be marked without looking
+    anything up first.
+    """
+    with _cursor() as cur:
+        cur.execute(
+            """
+            SELECT domain, business, status, times_surfaced, last_surfaced_at, first_seen_at
+            FROM growth_agent_prospects
+            WHERE status = 'surfaced'
+            ORDER BY last_surfaced_at DESC NULLS LAST, first_seen_at DESC
+            LIMIT %s
+            """,
+            (limit,),
+        )
+        return [
+            {
+                'domain': r[0],
+                'business': r[1],
+                'status': r[2],
+                'times_surfaced': r[3],
+                'last_surfaced_at': r[4].isoformat() if r[4] else None,
+                'first_seen_at': r[5].isoformat() if r[5] else None,
+            }
+            for r in cur.fetchall()
+        ]
+
+
+def mark_prospect(domain: str, status: str, outcome_note: Optional[str] = None) -> None:
+    """Marks a prospect 'contacted' or 'skipped', permanently excluding its
+    domain from the acquisition report (independent of the cooldown window).
+    UPSERTs, mirroring mark_lead: the domain is printed directly in the
+    report and may be marked before any daily job has surfaced it (or if
+    that write silently failed - same post-send swallow-and-log pattern as
+    the rest of the pipeline).
+
+    Raises on any DB error - used directly by scripts/mark_prospect.py, a
+    human-run one-off where a loud stack trace is the correct failure mode.
+    """
+    if status not in ('contacted', 'skipped'):
+        raise ValueError(f"status must be 'contacted' or 'skipped', got {status!r}")
+    with _cursor(commit=True) as cur:
+        cur.execute(
+            """
+            INSERT INTO growth_agent_prospects (domain, status, outcome_note, resolved_at)
+            VALUES (%s, %s, %s, now())
+            ON CONFLICT (domain) DO UPDATE
+            SET status = EXCLUDED.status, outcome_note = EXCLUDED.outcome_note, resolved_at = now()
+            """,
+            (domain, status, outcome_note),
+        )
 
 
 def mark_lead(email: str, status: str, outcome_note: Optional[str] = None) -> None:

@@ -31,16 +31,28 @@ import json
 import logging
 import os
 import re
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 from openai import OpenAI
 
-from .apify_prospecting import fetch_shopify_prospects
+from .apify_prospecting import fetch_shopify_prospects, normalize_prospect_domain
 from .brief import MODEL, OPENROUTER_BASE_URL, _extract_trackable_items
 from .metrics import collect_metrics
-from .tracking import get_excluded_lead_emails
+from .tracking import get_excluded_prospect_domains
 
 LOGGER = logging.getLogger(__name__)
+
+# Deterministic prospect surfacing - see _select_prospects_to_surface.
+# COOLDOWN_DAYS: a storefront surfaced in the report can't reappear for this
+# many days (permanent once marked contacted/skipped). DISPLAY_LIMIT: how
+# many prospects are picked (in code, before the LLM runs) and handed to the
+# prompt per run. MIN/MAX_PRODUCTS: the SMB catalog-size band used only to
+# DEMOTE (never drop) obvious non-fits so they don't crowd better candidates
+# out of the top N.
+PROSPECT_COOLDOWN_DAYS = int(os.environ.get('PROSPECT_COOLDOWN_DAYS', '30'))
+PROSPECT_DISPLAY_LIMIT = int(os.environ.get('PROSPECT_DISPLAY_LIMIT', '5'))
+PROSPECT_MIN_PRODUCTS = int(os.environ.get('PROSPECT_MIN_PRODUCTS', '3'))
+PROSPECT_MAX_PRODUCTS = int(os.environ.get('PROSPECT_MAX_PRODUCTS', '3000'))
 
 
 def collect_acquisition_data() -> Dict[str, Any]:
@@ -53,12 +65,15 @@ def collect_acquisition_data() -> Dict[str, Any]:
     must not block this email, since the rest of the report (leads,
     community, tracking) is still valuable on its own.
 
-    Reuses the SAME growth_agent_lead_outreach exclusion/registration
-    tracking.py already provides for lead_research (see scheduler.py's
-    register_new_leads call after this report sends) rather than building a
-    second, parallel dedup table - a prospect marked 'contacted' or
-    'skipped' via scripts/mark_lead.py stops resurfacing here too, exactly
-    like an exhausted lead does.
+    Prospect dedup is its own path, not growth_agent_lead_outreach:
+    get_excluded_prospect_domains() (keyed on normalized storefront domain,
+    with a cooldown window) filters the fetched list, then
+    _select_prospects_to_surface() deterministically picks and orders the
+    set that goes into the prompt - and that same set is what scheduler.py
+    hands to mark_prospects_surfaced() after the email sends, so nothing has
+    to be parsed back out of the LLM's output. A prospect marked
+    'contacted'/'skipped' via scripts/mark_prospect.py is excluded here
+    permanently.
     """
     metrics = collect_metrics()
     data_gaps = list(metrics['data_gaps'])
@@ -71,9 +86,17 @@ def collect_acquisition_data() -> Dict[str, Any]:
         data_gaps.append(f'Prospecting data unavailable this run: {exc}')
 
     if prospects is not None:
+        for p in prospects:
+            # myShopifyUrl first (immutable per store), custom domain as
+            # fallback. A None domain is allowed - the prospect is kept, it
+            # just can't be deduped or cooled down.
+            p['domain'] = (
+                normalize_prospect_domain(p.get('myshopify_url'))
+                or normalize_prospect_domain(p.get('website'))
+            )
         try:
-            excluded = get_excluded_lead_emails()
-            prospects = [p for p in prospects if not (p['email'] and p['email'] in excluded)]
+            excluded = get_excluded_prospect_domains(PROSPECT_COOLDOWN_DAYS)
+            prospects = [p for p in prospects if p['domain'] not in excluded]
         except Exception as exc:
             # Same fallback shape as metrics.py's own lead_research exclusion
             # step: a broken filter must never hide prospects that were
@@ -82,10 +105,52 @@ def collect_acquisition_data() -> Dict[str, Any]:
             LOGGER.exception('Prospect-exclusion lookup failed')
             data_gaps.append(
                 f'Prospect filtering unavailable this run - showing prospects unfiltered '
-                f'(may include an already-contacted/skipped one): {exc}'
+                f'(may include an already-contacted, skipped, or recently-shown one): {exc}'
             )
+        prospects = _select_prospects_to_surface(prospects)
 
     return {**metrics, 'prospects': prospects, 'data_gaps': data_gaps}
+
+
+def _in_icp_band(prospect: Dict[str, Any]) -> bool:
+    """True when the prospect's catalog size sits in DataLayer's SMB band.
+    Parses the trailing integer of product_count_range ("12-40" -> 40); a
+    missing, null, or otherwise unparseable range ("12-None", None, "") is
+    treated as OUT of band, so it gets demoted rather than trusted. Used
+    only to order the surfaced set - never to drop a prospect.
+    """
+    raw = prospect.get('product_count_range')
+    if not raw:
+        return False
+    try:
+        count = int(str(raw).rsplit('-', 1)[-1].strip())
+    except (TypeError, ValueError):
+        return False
+    return PROSPECT_MIN_PRODUCTS <= count <= PROSPECT_MAX_PRODUCTS
+
+
+def _select_prospects_to_surface(prospects: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Deterministic surfacing order + cap. Input-only and stable: the same
+    eligible pool always yields the same list, so the row set written to
+    growth_agent_prospects after the report sends is exactly the set the
+    report was built from - nothing has to be parsed back out of the LLM's
+    output.
+
+    The Apify actor's own discovery order is otherwise preserved. We only
+    DEMOTE (never drop) prospects that can't be tracked (null domain) or are
+    clearly outside DataLayer's ICP (product_count_range far above the SMB
+    band), so they don't crowd better fits out of the top N. The LLM still
+    makes the final per-block keep/skip decision when it renders.
+    """
+    ranked = sorted(
+        enumerate(prospects),
+        key=lambda iv: (
+            0 if iv[1].get('domain') else 1,     # untrackable domain -> last
+            0 if _in_icp_band(iv[1]) else 1,      # clear non-fit -> demoted
+            iv[0],                               # otherwise keep actor order
+        ),
+    )
+    return [p for _, p in ranked[:PROSPECT_DISPLAY_LIMIT]]
 
 
 # Shorter than brief.py's 500-800 word target - this report is a punch list,
@@ -154,19 +219,24 @@ to this report:
 - data_gaps: data sources that failed to load this run.
 - prospects (may be `null` if the Apify fetch failed or is unconfigured this run - see
   data_gaps; an empty list `[]` means the fetch succeeded but found nothing this run,
-  which is a normal outcome, NOT a data gap): up to ~25 real, live Shopify storefronts
-  found via the Apify "Shopify Store Finder" Actor, already excluding anyone already
-  marked contacted/skipped. Each has business, website, email (may be null - not every
-  storefront publishes one), country, currency, product_count_range (a MIN-MAX string
-  from the store's own catalog, e.g. "12-40" - a rough size proxy only, NOT a verified
-  employee/revenue count), theme, description. UNLIKE lead_research, this data is public
-  business contact info a merchant already publishes on their own storefront (not
-  DataLayer's own captured user data) - it is fine to include a prospect's business email
-  in this report, since the report's purpose is making outreach to it actionable. Judge
-  genuine fit from product_count_range (a very large range suggests an established store
-  that likely already has BI/ops tooling, not DataLayer's ICP), country/currency, and the
-  description - never assume fit from theme alone. If prospects is null or empty, say so
-  plainly rather than inventing one - see PROSPECTING's exact fallback lines below.
+  which is a normal outcome, NOT a data gap): up to 5 real, live Shopify storefronts,
+  already selected and ranked for you - already excluding businesses contacted, skipped,
+  or shown in a report in the last ~30 days. Each has business, website, email (may be
+  null - not every storefront publishes one), country, currency, product_count_range (a
+  MIN-MAX string from the store's own catalog, e.g. "12-40" - a rough size proxy only,
+  NOT a verified employee/revenue count), theme, description, and domain (the dedup key -
+  surface it ONLY on the PROSPECT block's own Domain: line below, verbatim, so it can be
+  pasted into internal suppression tooling; never weave it into prose or a draft
+  message). UNLIKE lead_research, this data is public business contact info a merchant
+  already publishes on their own storefront (not DataLayer's own captured user data) - it
+  is fine to include a prospect's business email in this report, since the report's
+  purpose is making outreach to it actionable. Judge genuine fit from product_count_range
+  (a very large range suggests an established store that likely already has BI/ops
+  tooling, not DataLayer's ICP), country/currency, and the description - never assume fit
+  from theme alone. Render one \U0001f52d PROSPECT block per entry, in the order given. Do
+  not add, reorder, or ask for more. Omit an entry's block only if it is a clear non-fit -
+  and write nothing about the omission. If prospects is null or empty, say so plainly
+  rather than inventing one - see PROSPECTING's exact fallback lines below.
 
 ==================================================
 CRITICAL RULES
@@ -206,7 +276,7 @@ words for the whole email, not counting the trailing JSON block.
 \U0001f3af DATALAYER CUSTOMER ACQUISITION REPORT
 
 \U0001f4c5 [today's date, written out]
-Mission: 0 -> first 10 real paying customers.
+Mission: +10 real paying customers.
 
 ━━━━━━━━━━━━━━━━━━━━
 
@@ -258,17 +328,20 @@ Hi there,
 
 [ALWAYS shown. If prospects is null, write exactly: "Prospect data unavailable this run -
 see ⚠️ WATCH." (the reason is already in data_gaps/WATCH, no need to repeat it here). If
-prospects is an empty list, write exactly: "No prospects found this run." Otherwise, up to
-5 of the best-fit prospects from the list, chosen using the judgment criteria in the
-prospects field docs above - never just the first 5 in list order. EACH prospect is its
-own self-contained block with its OWN draft message immediately inside it - repeat the
-full block (all 6 lines below) once per prospect, in order. Never write a single shared
-draft message after the whole list, and never let one prospect's draft end up attached to
-a different prospect or a different section (e.g. LEAD-BASED OUTREACH) - a block missing
-its own draft, or a draft under the wrong header, is incomplete/wrong:
+prospects is an empty list, write exactly: "No prospects found this run." Otherwise, one
+block per prospect in the list, in the order given - the list is already cooldown-filtered
+and best-fit-ranked upstream, so do not reorder it or drop entries to re-rank. Omit a
+block only for a clear non-fit (per the field docs), and say nothing about the omission.
+EACH prospect is its own self-contained block with its OWN draft message immediately
+inside it - repeat the full block (all 7 lines below) once per prospect, in order. Never
+write a single shared draft message after the whole list, and never let one prospect's
+draft end up attached to a different prospect or a different section (e.g. LEAD-BASED
+OUTREACH) - a block missing its own draft, or a draft under the wrong header, is
+incomplete/wrong:
 \U0001f52d PROSPECT #N
 Business: [business]
 Website: [website]
+Domain: [the exact `domain` value provided for this prospect, verbatim - or "(none)" if that field is null]
 Channel: [email, if present; otherwise "Website contact form"]
 Why they may need DataLayer: [grounded in product_count_range/country/description - never
 generic]
@@ -281,8 +354,8 @@ range or a specific detail from `description`) - no fabricated facts, no invente
 none is available, no claim that DataLayer has looked closely at their business beyond
 what's actually in the data.]
 
-Show fewer than 5 if fewer are genuinely good fits - never pad with a weak prospect to hit
-5.]
+The list may hold fewer than 5 - render exactly what's there (minus any clear non-fit);
+never invent or pad to a count.]
 
 ━━━━━━━━━━━━━━━━━━━━
 

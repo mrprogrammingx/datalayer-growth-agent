@@ -23,6 +23,7 @@ only a raised exception is.
 import logging
 import os
 from typing import Any, Dict, List, Optional
+from urllib.parse import urlsplit
 
 import requests
 
@@ -91,6 +92,33 @@ def fetch_shopify_prospects(
     return [_normalize_prospect(item) for item in items]
 
 
+def normalize_prospect_domain(raw: Optional[str]) -> Optional[str]:
+    """Pure. Reduces a storefront URL/host to a stable dedup key: the bare
+    hostname, lowercased, with a leading "www.", any ":port", and a trailing
+    "." stripped. Returns None for anything without a usable host (None,
+    empty/whitespace-only, or a value urlsplit can't pull a netloc from), or
+    for a value with no "." or embedded whitespace (not a real domain).
+
+    Used both by the acquisition report's cooldown filter (see
+    acquisition_report._select_prospects_to_surface) and by
+    scripts/mark_prospect.py, so the exact string a report is built around
+    is the exact key the CLI marks.
+    """
+    if not raw or not raw.strip():
+        return None
+    value = raw.strip()
+    if '://' not in value:
+        value = '//' + value
+    host = urlsplit(value).netloc.lower()
+    host = host.split(':', 1)[0]          # strip :port
+    if host.startswith('www.'):
+        host = host[len('www.'):]
+    host = host.rstrip('.')
+    if '.' not in host or any(c.isspace() for c in host):
+        return None
+    return host
+
+
 def _normalize_prospect(item: Dict[str, Any]) -> Dict[str, Any]:
     """Maps the Actor's raw output fields onto a small, stable shape - so a
     change in the Actor's own schema only needs a fix here, not in the LLM
@@ -111,6 +139,10 @@ def _normalize_prospect(item: Dict[str, Any]) -> Dict[str, Any]:
     return {
         'business': item.get('title') or item.get('shop'),
         'website': item.get('url') or item.get('myShopifyUrl'),
+        # The *.myshopify.com handle is immutable per store; a custom domain
+        # can lapse and change, so this is the more stable dedup identity and
+        # is preferred as the cooldown key (see normalize_prospect_domain).
+        'myshopify_url': item.get('myShopifyUrl'),
         'email': emails[0] if emails else None,
         'country': item.get('country'),
         'currency': item.get('currency'),

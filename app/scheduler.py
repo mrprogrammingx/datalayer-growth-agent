@@ -56,7 +56,7 @@ def run_growth_brief_job():
 def run_acquisition_report_job():
     from .acquisition_report import collect_acquisition_data, generate_acquisition_report
     from .email_sender import send_brief_email
-    from .tracking import record_new_items, register_new_leads
+    from .tracking import mark_prospects_surfaced, record_new_items, register_new_leads
 
     LOGGER.info('Running customer acquisition report job')
     metrics = collect_acquisition_data()
@@ -77,17 +77,24 @@ def run_acquisition_report_job():
         )
 
     try:
-        # Registers lead_research AND prospect emails into the same
-        # growth_agent_lead_outreach table - a prospect marked
-        # contacted/skipped via scripts/mark_lead.py stops resurfacing here,
-        # exactly like an exhausted lead does (see
-        # acquisition_report.collect_acquisition_data's docstring).
-        prospect_emails = [p['email'] for p in (metrics.get('prospects') or []) if p.get('email')]
-        lead_emails = [lead['email'] for lead in metrics['lead_research']]
-        register_new_leads(lead_emails + prospect_emails)
+        # lead_research emails only - prospects are tracked in their own
+        # growth_agent_prospects table now (see mark_prospects_surfaced
+        # below), not folded into growth_agent_lead_outreach.
+        register_new_leads([lead['email'] for lead in metrics['lead_research']])
     except Exception:
         LOGGER.exception(
             'TRACKING WRITE FAILED: could not register new lead-outreach rows '
+            '(email already sent - not blocked)'
+        )
+
+    try:
+        # metrics['prospects'] is already the exact set the report was built
+        # from - collect_acquisition_data() selects it deterministically, so
+        # there is nothing to parse back out of the LLM output.
+        mark_prospects_surfaced(metrics.get('prospects') or [])
+    except Exception:
+        LOGGER.exception(
+            'TRACKING WRITE FAILED: could not bump surfaced-prospect rows '
             '(email already sent - not blocked)'
         )
 

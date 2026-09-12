@@ -63,13 +63,13 @@ Put the resulting connection string in `.env` as `GROWTH_AGENT_DATABASE_URL`, us
 as the host (see network wiring in step 5) — no SSL needed on the private compose
 network, same as datalayer-ecommerce's own internal `web` → `db` connection.
 
-## 2. Create the tracking role + table
+## 2. Create the tracking role + tables
 
 Action/experiment tracking needs to persist state — something no other part of this
 app does. Rather than reuse `growth_agent_ro` (which must stay genuinely,
 DB-enforced read-only), this is a second, separate role scoped to `INSERT`/`SELECT`/
-`UPDATE` on one table only, so a bug in the tracking path can never put the read-only
-guarantee at risk. Run this once, same way as step 1:
+`UPDATE` on its own tables only, so a bug in the tracking path can never put the
+read-only guarantee at risk. Run this once, same way as step 1:
 
 ```bash
 docker compose -f ../datalayer-ecommerce/docker-compose.yml exec db psql -U datalayer -d datalayer
@@ -79,66 +79,66 @@ docker compose -f ../datalayer-ecommerce/docker-compose.yml exec db psql -U data
 CREATE ROLE growth_agent_tracking WITH LOGIN PASSWORD '...';
 GRANT CONNECT ON DATABASE datalayer TO growth_agent_tracking;
 GRANT USAGE ON SCHEMA public TO growth_agent_tracking;
-
-CREATE TABLE growth_agent_tracked_items (
-    id SERIAL PRIMARY KEY,
-    brief_date DATE NOT NULL,
-    category VARCHAR NOT NULL,       -- 'action' | 'experiment' (convention only)
-    description TEXT NOT NULL,
-    status VARCHAR NOT NULL DEFAULT 'pending',  -- 'pending' | 'done' | 'skipped'
-    outcome_note TEXT,
-    created_at TIMESTAMP NOT NULL DEFAULT now(),
-    resolved_at TIMESTAMP
-);
-
-GRANT SELECT, INSERT, UPDATE ON growth_agent_tracked_items TO growth_agent_tracking;
-GRANT USAGE, SELECT ON SEQUENCE growth_agent_tracked_items_id_seq TO growth_agent_tracking;
 ```
 
-The last GRANT matters — `SERIAL` creates an implicit sequence that needs its own
-grant under a non-owner role, or every `INSERT` fails. Do **not** grant this role
-anything on `users`/`uploads`/`csv_tool_leads`, same as the read-only role above.
+Do **not** grant this role anything on `users`/`uploads`/`csv_tool_leads`, same as the
+read-only role above.
 
 Put the resulting connection string in `.env` as `GROWTH_AGENT_TRACKING_DATABASE_URL`.
 This is optional — if unset, tracking degrades gracefully (see `data_gaps` in the
 brief) and the daily email still sends normally.
 
-**Same instance, needs running twice.** Like `growth_agent_ro`, local dev's Postgres
-and the VPS's Postgres are separate instances — run this SQL block once against each.
+**Then create the three tables this role writes to** —
+`growth_agent_tracked_items`, `growth_agent_lead_outreach`, and
+`growth_agent_prospects`. They live in a single checked-in [`sql/schema.sql`](sql/schema.sql);
+run it against the same Postgres instance:
 
-**Known limitation, not solved by this table**: it lives outside `datalayer-ecommerce`'s
-Alembic migration history (deliberately — see below), so a future DB restore that
-doesn't know about it could silently drop it. Same exposure `growth_agent_ro` already
-has today.
+```bash
+docker compose -f ../datalayer-ecommerce/docker-compose.yml exec -T db \
+  psql -v ON_ERROR_STOP=1 -U datalayer -d datalayer < sql/schema.sql
+```
+
+Each `CREATE TABLE IF NOT EXISTS` is immediately followed by its `SELECT, INSERT,
+UPDATE` table grant and the `USAGE, SELECT` grant on its `_id_seq` sequence — a `SERIAL`
+column's implicit sequence needs its own grant under a non-owner role, or every
+`INSERT` fails. The file is wrapped in `BEGIN; … COMMIT;`, so a partial apply can't
+happen. It only *creates* missing tables; it never migrates an existing one (see the
+file's header comment and "why not an Alembic migration" below).
+
+**Runs once per host** — like `growth_agent_ro`, local dev's Postgres and the VPS's
+Postgres are separate instances, so run both the `CREATE ROLE` block above and
+`sql/schema.sql` once against each — the same commands on the VPS.
+
+**Known limitation**: `sql/schema.sql` is a checked-in file in this repo, deliberately
+not wired into either repo's Alembic migration chain (see below), so a DB restore that
+predates these tables won't bring them back on its own — re-run `sql/schema.sql` after
+such a restore. Same exposure `growth_agent_ro` already has today.
 
 *(Why not an Alembic migration in `datalayer-ecommerce` instead? That repo's migration
 chain never issues GRANT/CREATE ROLE either — it's always a manual step, exactly like
-`growth_agent_ro`'s own setup above. Coupling this table's schema to the main app's
-migration chain would be unnecessary cross-repo entanglement for a table only
-growth-agent ever touches.)*
+`growth_agent_ro`'s own setup above. Coupling this schema to the main app's migration
+chain would be unnecessary cross-repo entanglement for tables only growth-agent ever
+touches.)*
 
-**Also add the lead-outreach tracking table**, same role, one more `GRANT` — no new
-`CREATE ROLE`, no new env var:
+**Why three separate tables**, all written by this one role:
 
-```sql
-CREATE TABLE growth_agent_lead_outreach (
-    id SERIAL PRIMARY KEY,
-    email VARCHAR NOT NULL UNIQUE,
-    status VARCHAR NOT NULL DEFAULT 'pending',  -- 'pending' | 'contacted' | 'skipped'
-    outcome_note TEXT,
-    first_seen_at TIMESTAMP NOT NULL DEFAULT now(),
-    resolved_at TIMESTAMP
-);
-
-GRANT SELECT, INSERT, UPDATE ON growth_agent_lead_outreach TO growth_agent_tracking;
-GRANT USAGE, SELECT ON SEQUENCE growth_agent_lead_outreach_id_seq TO growth_agent_tracking;
-```
-
-`email` is a plain `VARCHAR` with exact-match comparison, matching
-`users`/`csv_tool_leads.email`'s existing convention elsewhere (no `citext`, no
-lowercasing) — copy-paste the email from the brief rather than retyping it, to avoid a
-case mismatch silently missing an exclusion. See "Lead outreach tracking" below for
-what this table is for.
+- `growth_agent_tracked_items` — the daily brief's #1 Priority / Quick Wins /
+  Experiment, de-duped by exact-string match on `description`. Fine for LLM-invented
+  recommendation text (an accepted limitation); wrong for the two identities below.
+- `growth_agent_lead_outreach` — unconverted free-tool leads, keyed by `email`
+  `UNIQUE`. Email is a real, stable identity; `growth_agent_tracked_items`' string-match
+  model isn't, and the LLM rewords the same person's outreach draft differently every
+  day. `email` is a plain `VARCHAR` with exact-match comparison, matching
+  `users`/`csv_tool_leads.email`'s existing convention elsewhere (no `citext`, no
+  lowercasing) — copy-paste the email from the brief rather than retyping it, to avoid a
+  case mismatch silently missing an exclusion. See "Lead outreach tracking" below.
+- `growth_agent_prospects` — the acquisition report's Apify storefronts, keyed on
+  normalized storefront `domain` (a third identity type, distinct from a tracked item's
+  integer id and a lead's email; the `*.myshopify.com` handle when available, else the
+  custom domain — see `normalize_prospect_domain` in `app/apify_prospecting.py`). A row
+  exists only once a prospect has actually been surfaced in a report (or was marked
+  `contacted`/`skipped` directly via `scripts/mark_prospect.py`, which upserts) — there
+  is no pre-surfaced state, so there is no `'new'` status. See "Prospect tracking" below.
 
 ## 3. Google Analytics / Search Console setup
 
@@ -270,6 +270,11 @@ Fill in:
   (optional niche keyword, empty = broad discovery) — powers the customer acquisition
   report's PROSPECTING section; optional, degrades gracefully if unset (see
   "Automated customer acquisition reporting" below)
+- `PROSPECT_COOLDOWN_DAYS` (optional, default `30`), `PROSPECT_DISPLAY_LIMIT` (optional,
+  default `5`), `PROSPECT_MIN_PRODUCTS` / `PROSPECT_MAX_PRODUCTS` (optional, defaults `3`
+  / `3000` — the SMB product-count band used to demote obvious non-fits from the surfaced
+  set) — tune the acquisition report's prospect cooldown/selection; see "Prospect
+  tracking" below
 
 ## 6. Confirm the Docker network name
 
@@ -449,6 +454,20 @@ docker compose exec growth-agent python scripts/mark_lead.py someone@example.com
 See "Lead outreach tracking" below for why leads get their own table/script instead of
 reusing `growth_agent_tracked_items`/`mark_action.py`.
 
+Prospects from the customer acquisition report's PROSPECTING section work the same way
+again, with a **third** script (`scripts/mark_prospect.py`), keyed by normalized
+storefront domain — printed on each prospect's `Domain:` line in the report, so `list`
+is a convenience here too (and the CLI normalizes whatever host/URL form you paste):
+
+```bash
+docker compose exec growth-agent python scripts/mark_prospect.py list
+docker compose exec growth-agent python scripts/mark_prospect.py examplestore.myshopify.com contacted "sent outreach Sep 10"
+docker compose exec growth-agent python scripts/mark_prospect.py examplestore.com skipped "already on Triple Whale, not a fit"
+```
+
+See "Prospect tracking" below for why prospects get their own table/script, and for the
+~30-day cooldown that suppresses a business even before it's marked.
+
 ## Repo layout
 
 ```
@@ -456,12 +475,19 @@ docker-compose.yml
 Dockerfile
 requirements.txt
 .env.example
+sql/
+  schema.sql          Idempotent CREATE TABLE IF NOT EXISTS + grants for the three
+                       tables this service owns (tracked_items, lead_outreach,
+                       prospects); run once per host on a fresh/restored DB, not a
+                       migration tool (see setup step 2)
 scripts/
   authorize_google.py One-time local OAuth authorization helper (not in the Docker image)
   mark_action.py      CLI to list/resolve tracked action+experiment items (IS in the
                        Docker image - runs inside the container to reach Postgres)
   mark_lead.py        CLI to list/resolve lead-outreach status, keyed by email (IS in
                        the Docker image)
+  mark_prospect.py    CLI to list/resolve acquisition-report prospect status, keyed by
+                       normalized storefront domain (IS in the Docker image)
 app/
   main.py             Flask app: GET /health, GET /debug/ga4, GET /debug/search-console,
                        GET /debug/reddit, GET /debug/apify, POST /run-now,
@@ -471,8 +497,9 @@ app/
                        weekly report (default Monday 09:00 UTC)
   db.py               Read-only Postgres connection
   tracking.py         Write-scoped Postgres connection (separate role) for
-                       action/experiment tracking AND lead-outreach status - the only
-                       module that ever writes; shared by both daily LLM reports
+                       action/experiment tracking, lead-outreach status, AND
+                       acquisition-report prospect dedup/cooldown - the only module that
+                       ever writes; shared by both daily LLM reports
   metrics.py          Signup/upload/lead queries + GA4/Search Console/Reddit/pending-
                        tracking/attribution/lead-exclusion merge -> plain JSON; also
                        the weekly week-over-week metrics + shared attribution helper
@@ -523,9 +550,9 @@ the read-only one — see setup step 2), so each has a stable id, a status
 for how to review/resolve items via `scripts/mark_action.py`.
 
 **Known monitoring gap**: the tracking writes (`record_new_items`,
-`register_new_leads` in `app/scheduler.py`) happen after the day's email has already
-sent, each wrapped in its own try/except that only logs (prefixed `TRACKING WRITE
-FAILED:` so it's greppable) — this is deliberate, a tracking failure must never block
+`register_new_leads`, `mark_prospects_surfaced` in `app/scheduler.py`) happen after the
+day's email has already sent, each wrapped in its own try/except that only logs
+(prefixed `TRACKING WRITE FAILED:` so it's greppable) — this is deliberate, a tracking failure must never block
 the email. But if `GROWTH_AGENT_TRACKING_DATABASE_URL` is misconfigured in a way that
 breaks writes specifically (not simply unset, and not a connectivity problem that would
 also break the reads `pending_from_prior_briefs`/`resolved_action_outcomes` already
@@ -568,6 +595,55 @@ from `mark_action.py` since the two key on genuinely different identity types (e
 string vs. integer id), and `mark_lead()` upserts (unlike `mark_item()`'s UPDATE-only)
 since a lead's email is visible directly in the brief and might be marked before that
 day's registration write ever runs.
+
+## Prospect tracking
+
+The customer acquisition report's PROSPECTING section re-runs the same Apify actor with
+the same query every day, so it returns largely the same storefronts. The old dedup
+(an email filter against `growth_agent_lead_outreach`) missed prospects two ways: most
+Shopify storefronts publish no email at all, and a business only becomes excludable
+once someone runs a `mark_*` script. The same handful of businesses reappeared day
+after day.
+
+Fixed with a dedicated `growth_agent_prospects` table (setup step 2), keyed on
+**normalized storefront domain** — a third identity type, distinct from a tracked
+item's integer id and a lead's email, which is why it gets its own table and its own
+`scripts/mark_prospect.py`. The domain is the `*.myshopify.com` handle when the actor
+returns one (immutable per store), else the custom domain
+(`normalize_prospect_domain` in `app/apify_prospecting.py`).
+
+Lifecycle: `surfaced` → `contacted`/`skipped`. A row is created the moment a prospect
+is actually put in a report (`mark_prospects_surfaced`, after the email sends — same
+non-blocking pattern as the other tracking writes), or directly when marked via the
+CLI. `get_excluded_prospect_domains` then hides a domain from future reports while it's
+within the `PROSPECT_COOLDOWN_DAYS` (default 30) window since it was last surfaced, and
+**permanently** once it's `contacted`/`skipped`.
+
+**The surfaced set is chosen deterministically in code, not by the model.**
+`collect_acquisition_data()` filters the fetched list against the cooldown, then
+`_select_prospects_to_surface()` ranks and caps it to `PROSPECT_DISPLAY_LIMIT` — and
+that exact list is both what goes into the prompt and what
+`mark_prospects_surfaced()` writes to the cooldown table afterward. Nothing is parsed
+back out of the LLM's rendered markdown, so the cooldown record is always exact. The
+ranking preserves the actor's own discovery order but demotes (never drops) prospects
+with no trackable domain and prospects whose `product_count_range` falls outside the
+`PROSPECT_MIN_PRODUCTS`–`PROSPECT_MAX_PRODUCTS` SMB band, so obvious non-fits don't
+crowd better candidates out of the top N. The model still makes the final per-block
+keep/skip call when it renders — a block it declines to render still entered its
+cooldown, which is deliberate (a non-fit isn't worth resurfacing tomorrow).
+
+**Failure behavior**, same as lead-outreach filtering: if the exclusion lookup fails,
+the report falls back to the *unfiltered* prospect list rather than hiding everything,
+with a distinct `data_gaps` note. Every prospect DB call in the daily job path is
+non-blocking — the email always sends. `scripts/mark_prospect.py` fails loud, like the
+other human-run CLIs.
+
+Review/resolve via `scripts/mark_prospect.py` (setup step 10) — `list` shows
+still-`surfaced` prospects; `<domain> contacted|skipped [note]` resolves one (the CLI
+normalizes the argument, so a full `https://…` URL pasted from a browser also works).
+`mark_prospect()` upserts (like `mark_lead()`), since a domain is printed on each
+prospect's `Domain:` line in the report and might be marked before that day's
+surfaced-write ran.
 
 ## Brief format and prioritization
 
@@ -769,16 +845,18 @@ exact fallback lines):
 - **Lead-based outreach** — the same `lead_research` candidates the growth brief's Lead
   Outreach section draws from (DataLayer currently has no other named-individual,
   external-intent data source), with draft messages for human review only.
-- **Prospecting** — up to 5 real, live Shopify storefronts via the Apify "Shopify Store
-  Finder" Actor (`app/apify_prospecting.py`, `igolaizola/shopify-store-finder`), each with
+- **Prospecting** — up to `PROSPECT_DISPLAY_LIMIT` (default 5) real, live Shopify
+  storefronts via the Apify "Shopify Store Finder" Actor (`app/apify_prospecting.py`,
+  `igolaizola/shopify-store-finder`), each with
   business/website/contact-channel/why-they-fit/evidence and a draft outreach message.
   Optional — degrades gracefully (see `data_gaps`) if `APIFY_API_TOKEN` is unset or the
   Apify run fails, same philosophy as GA4/Search Console/Reddit. Unlike `lead_research`,
   a prospect's contact email is public information the merchant already publishes on
   their own storefront, so (unlike Lead-Based Outreach) it's fine for it to appear in the
-  report. Prospects and leads share the same `growth_agent_lead_outreach`
-  contacted/skipped tracking (`scripts/mark_lead.py`) — mark a prospect contacted or
-  skipped and it stops resurfacing here.
+  report. Prospects have their **own** dedup table (`growth_agent_prospects`) and script
+  (`scripts/mark_prospect.py`), keyed on normalized storefront domain — a ~30-day
+  cooldown keeps a business shown today from reappearing, and marking one
+  contacted/skipped excludes it permanently. See "Prospect tracking" below.
 - **Community opportunities** — Reddit only, same data source and draft-for-review
   convention as the growth brief's Community Opportunities section.
 - **Customer experiment** — at most one, same shape as the growth brief's Experiment

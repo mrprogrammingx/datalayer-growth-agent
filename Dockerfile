@@ -12,6 +12,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY app ./app
 COPY scripts/mark_action.py ./scripts/mark_action.py
 COPY scripts/mark_lead.py ./scripts/mark_lead.py
+COPY scripts/mark_prospect.py ./scripts/mark_prospect.py
 
 EXPOSE 8080
 
