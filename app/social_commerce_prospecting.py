@@ -40,7 +40,8 @@ import logging
 import os
 import re
 import time
-from typing import Any, Dict, List, Optional
+from datetime import date
+from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urljoin, urlsplit
 
 import requests
@@ -64,24 +65,43 @@ SITE_REQUEST_DELAY_SECONDS = 2
 REQUEST_TIMEOUT_SECONDS = 15
 REQUEST_HEADERS = {'User-Agent': 'Mozilla/5.0 (compatible; DataLayerGrowthAgent/1.0)'}
 
-# Verticals the original manual research found productive for small,
-# Instagram-active Armenian businesses (see sql/schema.sql's social_commerce
-# rows) - all six fetched and confirmed live during planning: each
-# `/en/yellow_pages/yp/<id>/` page-1 listing (the only page spyur.am's
-# robots.txt allows - paginated `-2`/`-3` suffixes are disallowed) returns
-# real `/en/companies/...` links. Override via SOCIAL_COMMERCE_CATEGORY_IDS
-# ("id:label,id:label,...") if a host wants a different seed list.
+# Small-business, retail-shaped verticals with a real page-1 company count
+# (spyur.am pages at exactly 20 companies/page, confirmed live - every id
+# below returned real `/en/companies/...` links on
+# `/en/yellow_pages/yp/<id>/`, the only page spyur.am's robots.txt allows -
+# paginated `-2`/`-3` suffixes are disallowed). '2570' (Handmade Jewelry, a
+# tiny 8-company leaf) was dropped in favor of the much larger general '282'
+# Jewelry Items Shop, which covers the same ground. Override via
+# SOCIAL_COMMERCE_CATEGORY_IDS ("id:label,id:label,...") if a host wants a
+# different seed list.
 DEFAULT_CATEGORY_IDS = {
     '299': 'Flowers',
-    '2570': 'Handmade Jewelry',
     '269': 'Confectionery/Bakery',
     '253': "Women's Clothing/Boutique",
     '1935': 'Cosmetics',
     '274': 'Souvenirs/Gifts',
+    '282': 'Jewelry',
+    '278': 'Clothing',
+    '287': 'Shoes/Footwear',
+    '252': "Kids' Clothing",
+    '286': 'Perfumes',
+    '305': 'Pet Supplies',
+    '753': 'Bags',
+    '1169': 'Wedding Dresses',
+    '256': 'Fashion Jewelry',
 }
 
+# 20 companies/category page (fixed, see above) x len(DEFAULT_CATEGORY_IDS)
+# categories can exceed a small cap well before the last category is ever
+# reached - fetch_social_commerce_candidates stops accumulating the moment
+# this cap is hit, in category-dict order, so a cap too close to (or below)
+# one category's own page size would starve every category after the first
+# few, every single day, regardless of cooldown. 100 comfortably covers
+# every configured category's full page-1 output in one run; the rotation
+# in fetch_social_commerce_candidates (see _rotated_categories) still
+# spreads load fairly if the seed list grows further.
 SOCIAL_COMMERCE_MAX_CANDIDATES_PER_RUN = int(
-    os.environ.get('SOCIAL_COMMERCE_MAX_CANDIDATES_PER_RUN', '40')
+    os.environ.get('SOCIAL_COMMERCE_MAX_CANDIDATES_PER_RUN', '100')
 )
 
 
@@ -112,14 +132,33 @@ def _parse_category_ids_env(raw: str) -> Dict[str, str]:
 def _default_category_ids() -> Dict[str, str]:
     """SOCIAL_COMMERCE_CATEGORY_IDS overrides DEFAULT_CATEGORY_IDS entirely
     when set and non-empty; an unset or empty env var (the common case)
-    keeps the 6 verified defaults untouched. Read lazily (not at import
-    time) so tests/callers can set the env var and still get the override.
+    keeps the verified defaults untouched. Read lazily (not at import time)
+    so tests/callers can set the env var and still get the override.
     """
     raw = os.environ.get('SOCIAL_COMMERCE_CATEGORY_IDS', '').strip()
     if not raw:
         return DEFAULT_CATEGORY_IDS
     parsed = _parse_category_ids_env(raw)
     return parsed or DEFAULT_CATEGORY_IDS
+
+
+def _rotated_categories(category_ids: Dict[str, str]) -> List[Tuple[str, str]]:
+    """Returns `category_ids` as a (category_id, label) list, rotated by a
+    deterministic day-of-year offset so a DIFFERENT category gets first
+    priority each day. fetch_social_commerce_candidates stops accumulating
+    once max_candidates is hit, in list order - without rotation, the same
+    early categories in dict order would win that race every single day,
+    permanently starving whichever categories happen to sort last (real risk
+    once the seed list is bigger than max_candidates // ~20-per-page).
+    Deterministic (no persisted state needed) and stable within a day, so a
+    retried run doesn't reshuffle mid-way.
+    """
+    items = list(category_ids.items())
+    if not items:
+        return items
+    offset = date.today().toordinal() % len(items)
+    return items[offset:] + items[:offset]
+
 
 # A company page lists /en/companies/<slug>/<id> (and occasionally the bare
 # /en/companies/<id> form before redirect) - matched against the category
@@ -167,7 +206,18 @@ _PLACEHOLDER_ATTR_RE = re.compile(r'placeholder=["\'][^"\']*["\']', re.IGNORECAS
 _ASSET_EXTENSIONS = ('png', 'jpg', 'jpeg', 'gif', 'svg', 'webp', 'ico', 'css', 'js', 'woff', 'woff2', 'ttf')
 _UNUSABLE_LOCAL_PARTS = ('noreply', 'no-reply', 'donotreply', 'webmaster', 'postmaster', 'abuse')
 
-_CONTACT_PAGE_GUESSES = ('/contact', '/contacts', '/en/contact', '/en/contacts', '/about', '/en/about', '/pages/contact')
+_CONTACT_PAGE_GUESSES = ('/contact', '/en/contact', '/about', '/en/about', '/pages/contact')
+
+# A single flat 15s timeout on an arbitrary small-business site (as opposed
+# to spyur.am itself, one known-reliable host) turned out live to mean up to
+# 15s to CONNECT *and*, separately, up to 15s to READ on a single request -
+# a worst-case 30s per attempt. With up to 8 attempts per candidate (1
+# homepage + up to len(_CONTACT_PAGE_GUESSES) guesses) and up to ~100
+# candidates/run, a run with many slow/dead candidate sites was observed
+# live to stretch well past an hour. Tighter, split timeouts bound the
+# worst case per attempt to ~13s instead of ~30s.
+SITE_CONNECT_TIMEOUT_SECONDS = 5
+SITE_READ_TIMEOUT_SECONDS = 8
 
 
 def _spyur_get(path: str) -> Optional[str]:
@@ -190,18 +240,30 @@ def _spyur_get(path: str) -> Optional[str]:
         time.sleep(SPYUR_REQUEST_DELAY_SECONDS)
 
 
-def _site_get(url: str) -> Optional[str]:
+def _site_get(url: str) -> Tuple[Optional[str], bool]:
     """GET an arbitrary candidate website URL. Never raises - a candidate's
     site being unreachable just means no email is discoverable there, which
     correctly fails gate 3 for that candidate rather than aborting the run.
+
+    Returns (html_or_None, host_unreachable). host_unreachable is True only
+    for a connection-level failure (DNS failure, connection refused, a
+    connect-phase timeout) - a genuine "this host is down" signal, as
+    opposed to a 404 or a slow-but-working response. _discover_email uses
+    this to stop trying further guessed paths on a confirmed-dead host
+    rather than burning the same timeout on each one in turn.
     """
     try:
-        response = requests.get(url, headers=REQUEST_HEADERS, timeout=REQUEST_TIMEOUT_SECONDS)
+        response = requests.get(
+            url, headers=REQUEST_HEADERS,
+            timeout=(SITE_CONNECT_TIMEOUT_SECONDS, SITE_READ_TIMEOUT_SECONDS),
+        )
         if response.status_code >= 400:
-            return None
-        return response.text
+            return None, False
+        return response.text, False
+    except (requests.exceptions.ConnectionError, requests.exceptions.ConnectTimeout):
+        return None, True
     except requests.RequestException:
-        return None
+        return None, False
     finally:
         time.sleep(SITE_REQUEST_DELAY_SECONDS)
 
@@ -370,10 +432,19 @@ def _discover_email(website: str) -> Optional[str]:
     contact/about page guesses, stopping at the first usable email found.
     Never raises - an unreachable or email-less site just means this
     candidate fails gate 3, handled by the caller.
+
+    Stops immediately (skipping the remaining guesses) the moment ANY fetch
+    on this host reports host_unreachable (see _site_get) - a connection-
+    level failure on one path means every other path on the SAME host will
+    almost certainly fail the same way, so trying them just burns the same
+    timeout again for nothing. A 404 or an empty-but-reachable page does NOT
+    stop the loop - only a confirmed-dead host does.
     """
     if not website:
         return None
-    homepage_html = _site_get(website)
+    homepage_html, unreachable = _site_get(website)
+    if unreachable:
+        return None
     if homepage_html:
         email = _extract_email(homepage_html)
         if email:
@@ -384,7 +455,9 @@ def _discover_email(website: str) -> Optional[str]:
         return None
     base = f'{parsed.scheme or "https"}://{parsed.netloc}'
     for path in _CONTACT_PAGE_GUESSES:
-        html = _site_get(base + path)
+        html, unreachable = _site_get(base + path)
+        if unreachable:
+            break
         if not html:
             continue
         email = _extract_email(html)
@@ -435,6 +508,11 @@ def fetch_social_commerce_candidates(
     links, a systemic-outage signal distinct from "today's businesses just
     didn't have websites." Callers (app/scheduler.py) must catch this and
     degrade gracefully, same contract as apify_prospecting.fetch_shopify_prospects.
+
+    Categories are walked in a day-rotated order (see _rotated_categories),
+    not dict-definition order - once `max_candidates` is hit, remaining
+    categories are skipped for THIS run, so a fixed order would let the same
+    early categories starve every later one, every single day.
     """
     if category_ids is None:
         category_ids = _default_category_ids()
@@ -444,7 +522,7 @@ def fetch_social_commerce_candidates(
     candidates: List[Dict[str, Any]] = []
     categories_with_links = 0
 
-    for category_id, label in category_ids.items():
+    for category_id, label in _rotated_categories(category_ids):
         if len(candidates) >= max_candidates:
             break
         try:
