@@ -32,6 +32,16 @@
 -- manual run of:
 --   ALTER TABLE growth_agent_prospects ADD COLUMN IF NOT EXISTS draft_message TEXT;
 -- (see README section 2 for the exact docker-wrapped psql invocation).
+--
+-- EXAMPLE #2 (one-time, existing hosts only): growth_agent_prospects.segment was added
+-- when the 18:30 social_commerce acquisition experiment started, alongside the 12:30
+-- shopify_smb one already writing to this table. DEFAULT 'shopify_smb' means a host with
+-- the table already created needs only:
+--   ALTER TABLE growth_agent_prospects ADD COLUMN IF NOT EXISTS segment VARCHAR NOT NULL DEFAULT 'shopify_smb';
+-- which correctly backfills every pre-existing row (all from the 12:30 task) without any
+-- code change to that task - it never sets segment explicitly and keeps getting the
+-- default. Only the 18:30 task's own insert path sets segment = 'social_commerce'
+-- explicitly.
 
 BEGIN;
 
@@ -61,7 +71,9 @@ GRANT USAGE, SELECT ON SEQUENCE growth_agent_lead_outreach_id_seq TO growth_agen
 
 CREATE TABLE IF NOT EXISTS growth_agent_prospects (
     id SERIAL PRIMARY KEY,
-    domain VARCHAR NOT NULL UNIQUE,              -- normalized dedup key (see normalize_prospect_domain)
+    domain VARCHAR NOT NULL UNIQUE,              -- normalized dedup key (see normalize_prospect_domain);
+                                                  -- for a website-less prospect, "instagram.com/<handle>" or
+                                                  -- "facebook.com/<handle>" WITH the handle included
     business VARCHAR,
     website VARCHAR,
     email VARCHAR,
@@ -71,7 +83,11 @@ CREATE TABLE IF NOT EXISTS growth_agent_prospects (
     first_seen_at TIMESTAMP NOT NULL DEFAULT now(),
     last_surfaced_at TIMESTAMP,
     outcome_note TEXT,
-    resolved_at TIMESTAMP
+    resolved_at TIMESTAMP,
+    segment VARCHAR NOT NULL DEFAULT 'shopify_smb'  -- 'shopify_smb' (12:30 Apify/Shopify task) |
+                                                     -- 'social_commerce' (18:30 Instagram-first task) -
+                                                     -- lets the two acquisition-channel experiments share
+                                                     -- one tracking table and still be compared/queried apart
 );
 GRANT SELECT, INSERT, UPDATE ON growth_agent_prospects TO growth_agent_tracking;
 GRANT USAGE, SELECT ON SEQUENCE growth_agent_prospects_id_seq TO growth_agent_tracking;
