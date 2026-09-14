@@ -6,6 +6,7 @@ the private Docker network, and .env for GROWTH_AGENT_TRACKING_DATABASE_URL)
 
 Usage:
     docker compose exec growth-agent python scripts/mark_prospect.py list
+    docker compose exec growth-agent python scripts/mark_prospect.py list --segment social_commerce
     docker compose exec growth-agent python scripts/mark_prospect.py examplestore.myshopify.com contacted "sent outreach Sep 10"
     docker compose exec growth-agent python scripts/mark_prospect.py examplestore.com skipped "already on Triple Whale, not a fit"
 
@@ -34,13 +35,13 @@ from app.tracking import get_reviewable_prospects, mark_prospect  # noqa: E402
 
 USAGE = (
     'Usage:\n'
-    '  mark_prospect.py list\n'
+    '  mark_prospect.py list [--segment <name>]\n'
     '  mark_prospect.py <domain> <contacted|skipped> [note]'
 )
 
 
-def _cmd_list():
-    prospects = get_reviewable_prospects(limit=50)
+def _cmd_list(segment=None):
+    prospects = get_reviewable_prospects(limit=50, segment=segment)
     if not prospects:
         print('No prospects to review.')
         return
@@ -49,7 +50,8 @@ def _cmd_list():
         business = p['business'] or '(no business name)'
         print(
             f"{p['domain']} — {business} "
-            f"({p['status']}, surfaced {p['times_surfaced']}x, last {last})"
+            f"({p['status']}, surfaced {p['times_surfaced']}x, last {last}) "
+            f"[{p['segment']}]"
         )
         if p.get('draft_message'):
             indented = '\n'.join(f'    {line}' for line in p['draft_message'].splitlines())
@@ -83,7 +85,17 @@ def main():
         return
 
     if argv[0] == 'list':
-        _cmd_list()
+        rest = argv[1:]
+        segment = None
+        if rest and rest[0] == '--segment':
+            if len(rest) < 2:
+                print(f'--segment requires a value\n\n{USAGE}', file=sys.stderr)
+                sys.exit(1)
+            segment = rest[1]
+        elif rest:
+            print(f'unrecognized arguments after list: {rest!r}\n\n{USAGE}', file=sys.stderr)
+            sys.exit(1)
+        _cmd_list(segment=segment)
         return
 
     if len(argv) < 2:

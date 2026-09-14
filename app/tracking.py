@@ -325,12 +325,14 @@ def get_pending_leads(limit: int = 50) -> List[Dict[str, Any]]:
         return [{'email': r[0], 'first_seen_at': r[1].isoformat()} for r in cur.fetchall()]
 
 
-def get_excluded_prospect_domains(cooldown_days: int) -> set:
+def get_excluded_prospect_domains(cooldown_days: int, segment: str = 'shopify_smb') -> set:
     """Normalized storefront domains that must NOT be surfaced in the
     customer acquisition report this run: any already marked 'contacted' or
     'skipped' (permanent), plus any surfaced within the last `cooldown_days`
     days (temporary - ages out on its own once last_surfaced_at falls
-    outside the window).
+    outside the window). Scoped to `segment` - each acquisition experiment's
+    cooldown is independent of the other's, even though both write to this
+    one table.
 
     The interval is computed in SQL (now() - make_interval(...)), consistent
     with get_resolved_items_for_attribution, to avoid app-server/DB clock
@@ -344,16 +346,17 @@ def get_excluded_prospect_domains(cooldown_days: int) -> set:
         cur.execute(
             """
             SELECT domain FROM growth_agent_prospects
-            WHERE status IN ('contacted', 'skipped')
-               OR (last_surfaced_at IS NOT NULL
-                   AND last_surfaced_at > now() - make_interval(days => %s))
+            WHERE segment = %s
+              AND (status IN ('contacted', 'skipped')
+                   OR (last_surfaced_at IS NOT NULL
+                       AND last_surfaced_at > now() - make_interval(days => %s)))
             """,
-            (cooldown_days,),
+            (segment, cooldown_days),
         )
         return {row[0] for row in cur.fetchall()}
 
 
-def mark_prospects_surfaced(prospects: List[Dict[str, Any]]) -> int:
+def mark_prospects_surfaced(prospects: List[Dict[str, Any]], segment: str = 'shopify_smb') -> int:
     """One idempotent upsert per prospect actually surfaced in today's
     acquisition report - bumps times_surfaced and sets last_surfaced_at to
     now(), which is what starts the cooldown window in
@@ -365,6 +368,10 @@ def mark_prospects_surfaced(prospects: List[Dict[str, Any]]) -> int:
     one run can't double-bump a single row. Never overwrites the first-seen
     business/website/email on conflict, and never resets a row already
     marked 'contacted'/'skipped' back to 'surfaced'.
+
+    `segment` is written only on INSERT, never on the ON CONFLICT UPDATE - a
+    prospect's segment is set once at creation and must never change on
+    re-surfacing, unlike draft_message below.
 
     draft_message is the deliberate exception to "never overwrites": unlike
     business/website/email (static storefront facts), the LLM redrafts a
@@ -394,8 +401,8 @@ def mark_prospects_surfaced(prospects: List[Dict[str, Any]]) -> int:
             cur.execute(
                 """
                 INSERT INTO growth_agent_prospects
-                    (domain, business, website, email, draft_message, status, times_surfaced, last_surfaced_at)
-                VALUES (%s, %s, %s, %s, %s, 'surfaced', 1, now())
+                    (domain, business, website, email, draft_message, status, times_surfaced, last_surfaced_at, segment)
+                VALUES (%s, %s, %s, %s, %s, 'surfaced', 1, now(), %s)
                 ON CONFLICT (domain) DO UPDATE
                 SET last_surfaced_at = now(),
                     times_surfaced   = growth_agent_prospects.times_surfaced + 1,
@@ -409,34 +416,42 @@ def mark_prospects_surfaced(prospects: List[Dict[str, Any]]) -> int:
                     prospect.get('website'),
                     prospect.get('email'),
                     prospect.get('draft_message'),
+                    segment,
                 ),
             )
             affected += cur.rowcount
         return affected
 
 
-def get_reviewable_prospects(limit: int = 50) -> List[Dict[str, Any]]:
+def get_reviewable_prospects(limit: int = 50, segment: Optional[str] = None) -> List[Dict[str, Any]]:
     """For scripts/mark_prospect.py's `list` command - prospects still in
     'surfaced' state (not yet contacted/skipped), most-recently-surfaced
     first. A convenience, not a hard requirement: the domain is printed
     directly in the report, so a prospect can be marked without looking
     anything up first.
 
+    segment=None (the default) shows every segment, preserving this
+    function's pre-segment behavior for existing callers. Passing a segment
+    name scopes the listing to just that acquisition experiment.
+
     Includes draft_message so a prospect can be reviewed and marked
     contacted/skipped straight from this CLI, without digging back through
     old report emails to find what was actually drafted for it.
     """
+    query = (
+        "SELECT domain, business, status, times_surfaced, last_surfaced_at, "
+        "first_seen_at, draft_message, segment "
+        "FROM growth_agent_prospects WHERE status = 'surfaced'"
+    )
+    params: List[Any] = []
+    if segment is not None:
+        query += " AND segment = %s"
+        params.append(segment)
+    query += " ORDER BY last_surfaced_at DESC NULLS LAST, first_seen_at DESC LIMIT %s"
+    params.append(limit)
+
     with _cursor() as cur:
-        cur.execute(
-            """
-            SELECT domain, business, status, times_surfaced, last_surfaced_at, first_seen_at, draft_message
-            FROM growth_agent_prospects
-            WHERE status = 'surfaced'
-            ORDER BY last_surfaced_at DESC NULLS LAST, first_seen_at DESC
-            LIMIT %s
-            """,
-            (limit,),
-        )
+        cur.execute(query, tuple(params))
         return [
             {
                 'domain': r[0],
@@ -446,6 +461,7 @@ def get_reviewable_prospects(limit: int = 50) -> List[Dict[str, Any]]:
                 'last_surfaced_at': r[4].isoformat() if r[4] else None,
                 'first_seen_at': r[5].isoformat() if r[5] else None,
                 'draft_message': r[6],
+                'segment': r[7],
             }
             for r in cur.fetchall()
         ]
