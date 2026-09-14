@@ -395,12 +395,17 @@ def mark_prospects_surfaced(prospects: List[Dict[str, Any]], segment: str = 'sho
 
     RESEARCH_FIELDS (instagram_url, facebook_url, country, sells,
     sales_evidence, activity_notes, platform, contact_name, other_contact,
-    fit_reason, personalization_note, lead_quality) follow the exact same
-    COALESCE(EXCLUDED.field, growth_agent_prospects.field) pattern as
-    draft_message, not the never-overwrite group business/website/email are
-    in - these are research findings that should improve on a later run with
-    better research, but a run that finds nothing new for a field must never
-    blank out a previously-good value.
+    fit_reason, personalization_note, lead_quality) are the OPPOSITE of
+    draft_message: COALESCE(growth_agent_prospects.field, EXCLUDED.field) -
+    once a field has a real value, no later run overwrites it; a run only
+    fills in a field that's still NULL. This is deliberately NOT "a later
+    run with better research refreshes it": these fields can be populated by
+    runs of very different research depth (e.g. a human/agent doing live
+    browsing and judgment calls vs. an automated scrape+LLM pass with no live
+    browsing at all), and a weaker later pass silently overwriting a
+    stronger earlier one would be a real data-quality regression, not an
+    improvement. A run that wants to genuinely correct an existing field
+    needs a direct UPDATE, not a re-surface.
 
     Raises on any error - scheduler.py catches, logs the greppable
     'TRACKING WRITE FAILED:' prefix, and never lets it block the (already
@@ -408,7 +413,7 @@ def mark_prospects_surfaced(prospects: List[Dict[str, Any]], segment: str = 'sho
     """
     research_columns = ', '.join(RESEARCH_FIELDS)
     research_set = ',\n                    '.join(
-        f'{field} = COALESCE(EXCLUDED.{field}, growth_agent_prospects.{field})'
+        f'{field} = COALESCE(growth_agent_prospects.{field}, EXCLUDED.{field})'
         for field in RESEARCH_FIELDS
     )
 

@@ -4,10 +4,13 @@ trigger routes.
 Not routed through nginx and has no published port in docker-compose.yml -
 /run-now, /acquisition-report-now, and /weekly-report-now all send real
 emails (/run-now and /acquisition-report-now also make a real, billed
-OpenAI call), so this must never be publicly reachable. Use `docker exec`
+OpenAI call). /social-commerce-discovery-now sends NO email but DOES write
+to growth_agent_prospects and may make a real, billed OpenRouter call - see
+its own docstring. This must never be publicly reachable. Use `docker exec`
 or curl from inside the Docker network to hit it for manual testing.
 """
 import logging
+import threading
 
 from flask import Flask, jsonify
 
@@ -18,9 +21,11 @@ from .scheduler import (
     start_scheduler,
     run_acquisition_report_job,
     run_growth_brief_job,
+    run_social_commerce_discovery_job,
     run_weekly_report_job,
 )
 from .search_console import fetch_search_console_metrics
+from .social_commerce_prospecting import fetch_social_commerce_candidates
 
 logging.basicConfig(level=logging.INFO)
 
@@ -89,6 +94,20 @@ def debug_apify():
         return jsonify({'status': 'error', 'error': str(exc)}), 500
 
 
+@app.get('/debug/spyur')
+def debug_spyur():
+    """Calls fetch_social_commerce_candidates() with a tiny cap and returns
+    raw JSON - no LLM call, no DB write. Unlike /debug/apify, this is a
+    free, credential-free public scrape (spyur.am), so this is purely a
+    wiring/reachability check, not a cost check.
+    """
+    try:
+        return jsonify(fetch_social_commerce_candidates(max_candidates=3))
+    except Exception as exc:
+        logging.exception('debug/spyur failed')
+        return jsonify({'status': 'error', 'error': str(exc)}), 500
+
+
 @app.post('/run-now')
 def run_now():
     """Manual trigger for testing. Makes a real OpenAI API call and sends a
@@ -128,6 +147,41 @@ def weekly_report_now():
         return jsonify({'status': 'sent', 'report': report_text})
     except Exception as exc:
         logging.exception('weekly-report-now failed')
+        return jsonify({'status': 'error', 'error': str(exc)}), 500
+
+
+@app.post('/social-commerce-discovery-now')
+def social_commerce_discovery_now():
+    """Manual trigger for testing. Unlike every other manual trigger in this
+    file, does NOT run synchronously and does NOT return a summary in the
+    response - it fires run_social_commerce_discovery_job() in a background
+    thread and returns immediately with status 'started'.
+
+    This is deliberate, not a shortcut: gunicorn's own --timeout 120
+    (Dockerfile) - already raised once, see its own comment, for the
+    LLM-call-bound jobs above - is nowhere near enough for THIS job's true
+    runtime (multiple minutes, paced by spyur.am's own Crawl-delay: 10 on
+    every request to it). Running it synchronously was tried first and
+    confirmed live to hit gunicorn's WORKER TIMEOUT well before completion,
+    killing the worker mid-fetch and silently losing every candidate found
+    so far - nothing had been persisted yet, since mark_prospects_surfaced()
+    is the job's last step. A background thread sidesteps gunicorn's
+    per-request timeout entirely (the actual DAILY run has the same
+    property already, for free - APScheduler runs jobs in its own thread,
+    never through a gunicorn request/worker at all, so it was never at risk
+    here).
+
+    Check results via `docker logs` for the
+    'Social commerce discovery complete: ...' line, or query
+    growth_agent_prospects directly - not this response, which only
+    confirms the job started.
+    """
+    try:
+        thread = threading.Thread(target=run_social_commerce_discovery_job, daemon=True)
+        thread.start()
+        return jsonify({'status': 'started'})
+    except Exception as exc:
+        logging.exception('social-commerce-discovery-now failed to start')
         return jsonify({'status': 'error', 'error': str(exc)}), 500
 
 

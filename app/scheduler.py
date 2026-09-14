@@ -1,9 +1,13 @@
-"""Three APScheduler jobs on one BackgroundScheduler instance: the daily
+"""Four APScheduler jobs on one BackgroundScheduler instance: the daily
 metrics -> LLM -> email growth brief, a daily metrics -> LLM -> email
-customer acquisition report (see acquisition_report.py), and a weekly
-deterministic rollup report (no LLM call - see weekly_report.py). All three
-are additive - none replaces another, they're different content sent as
-separate emails.
+customer acquisition report for the shopify_smb segment (see
+acquisition_report.py), a weekly deterministic rollup report (no LLM call -
+see weekly_report.py), and a daily silent discovery pipeline for the
+social_commerce segment (see social_commerce_prospecting.py /
+social_commerce_qualification.py) - unlike the other three, this one sends
+no email; it only persists to growth_agent_prospects, reviewed via
+scripts/mark_prospect.py list --segment social_commerce. All four are
+additive - none replaces another.
 """
 import logging
 import os
@@ -14,6 +18,11 @@ from apscheduler.schedulers.background import BackgroundScheduler
 LOGGER = logging.getLogger(__name__)
 
 _scheduler = None
+
+# Own constant, deliberately not reusing acquisition_report.py's
+# PROSPECT_COOLDOWN_DAYS - tracking.py already documents the two segments'
+# cooldowns as independent (get_excluded_prospect_domains is segment-scoped).
+SOCIAL_COMMERCE_COOLDOWN_DAYS = int(os.environ.get('SOCIAL_COMMERCE_COOLDOWN_DAYS', '30'))
 
 
 def run_growth_brief_job():
@@ -101,6 +110,79 @@ def run_acquisition_report_job():
     return report_markdown
 
 
+def run_social_commerce_discovery_job():
+    """Silent discovery pipeline for the social_commerce segment - no email
+    is sent (unlike the other three jobs on this scheduler); it only
+    discovers, qualifies, and persists to growth_agent_prospects. Reviewed
+    via `scripts/mark_prospect.py list --segment social_commerce`, not a
+    daily inbox item.
+
+    Every stage is independently wrapped: a discovery failure means nothing
+    to qualify or persist this run (logged, not raised further - there's no
+    already-sent email this could ever "block"), a cooldown-lookup failure
+    falls back to the unfiltered candidate list (same fallback shape as
+    acquisition_report.py's own prospect-exclusion lookup), and a
+    qualification failure just means this run's candidates get persisted
+    without research-field/draft_message detail rather than not persisted
+    at all - each hard-gated candidate should still start its cooldown so
+    it isn't re-scraped and re-billed tomorrow regardless of whether the
+    LLM step succeeded.
+
+    Returns a small summary dict (eligible/qualified/persisted counts) -
+    logged at the end either way, since this job has no email to carry that
+    signal to a human instead.
+    """
+    from .social_commerce_prospecting import fetch_social_commerce_candidates
+    from .social_commerce_qualification import qualify_and_draft_candidates
+    from .tracking import get_excluded_prospect_domains, mark_prospects_surfaced
+
+    LOGGER.info('Running social commerce discovery job')
+
+    candidates = []
+    try:
+        candidates = fetch_social_commerce_candidates()
+    except Exception:
+        LOGGER.exception('Social commerce discovery failed - nothing to persist this run')
+
+    if candidates:
+        try:
+            excluded = get_excluded_prospect_domains(SOCIAL_COMMERCE_COOLDOWN_DAYS, segment='social_commerce')
+            candidates = [c for c in candidates if c.get('domain') not in excluded]
+        except Exception:
+            LOGGER.exception(
+                'Social commerce cooldown lookup failed - continuing with the unfiltered '
+                'candidate list (may re-surface an already-contacted/skipped/recent prospect)'
+            )
+
+    qualified_by_domain = {}
+    if candidates:
+        try:
+            qualified_by_domain = qualify_and_draft_candidates(candidates)
+        except Exception:
+            LOGGER.exception(
+                'Social commerce LLM qualification failed - persisting scraped candidates '
+                'without qualification detail'
+            )
+        for candidate in candidates:
+            candidate.update(qualified_by_domain.get(candidate.get('domain'), {}))
+
+    persisted = 0
+    try:
+        persisted = mark_prospects_surfaced(candidates, segment='social_commerce')
+    except Exception:
+        LOGGER.exception(
+            'TRACKING WRITE FAILED: could not persist social commerce prospects '
+            '(no email was sent this run - nothing else to protect)'
+        )
+
+    summary = {'eligible': len(candidates), 'qualified': len(qualified_by_domain), 'persisted': persisted}
+    LOGGER.info(
+        'Social commerce discovery complete: eligible %d, LLM-qualified %d, persisted %d',
+        summary['eligible'], summary['qualified'], summary['persisted'],
+    )
+    return summary
+
+
 def run_weekly_report_job():
     from .weekly_report import collect_weekly_data, render_weekly_report
     from .email_sender import send_brief_email
@@ -121,6 +203,9 @@ def start_scheduler():
     acquisition_hour = int(os.environ.get('ACQUISITION_REPORT_SEND_HOUR_UTC', '8'))
     weekly_day = os.environ.get('WEEKLY_REPORT_SEND_DAY_UTC', 'mon')
     weekly_hour = int(os.environ.get('WEEKLY_REPORT_SEND_HOUR_UTC', '9'))
+    # Default 14 -> 14:30 UTC = 18:30 Yerevan time (Armenia is fixed UTC+4,
+    # no DST observed).
+    social_commerce_hour = int(os.environ.get('SOCIAL_COMMERCE_DISCOVERY_HOUR_UTC', '14'))
 
     _scheduler = BackgroundScheduler(timezone='UTC')
     _scheduler.add_job(
@@ -151,8 +236,17 @@ def start_scheduler():
         id='weekly_growth_report',
         replace_existing=True,
     )
+    _scheduler.add_job(
+        run_social_commerce_discovery_job,
+        trigger='cron',
+        hour=social_commerce_hour,
+        minute=30,
+        id='social_commerce_discovery',
+        replace_existing=True,
+    )
     _scheduler.start()
     LOGGER.info('Scheduler started: daily growth brief at %02d:00 UTC', hour)
     LOGGER.info('Scheduler started: daily customer acquisition report at %02d:30 UTC', acquisition_hour)
     LOGGER.info('Scheduler started: weekly growth report on %s at %02d:00 UTC', weekly_day, weekly_hour)
+    LOGGER.info('Scheduler started: social commerce discovery at %02d:30 UTC', social_commerce_hour)
     return _scheduler
