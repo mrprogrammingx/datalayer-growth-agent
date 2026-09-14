@@ -42,6 +42,26 @@
 -- code change to that task - it never sets segment explicitly and keeps getting the
 -- default. Only the 18:30 task's own insert path sets segment = 'social_commerce'
 -- explicitly.
+--
+-- EXAMPLE #3 (one-time, existing hosts only): 11 nullable research-detail columns
+-- (instagram_url, facebook_url, country, sells, sales_evidence, activity_notes, platform,
+-- contact_name, other_contact, fit_reason, personalization_note, lead_quality) were added
+-- so the social_commerce task's full findings - not just business/website/email/
+-- draft_message - persist instead of living only in the report/chat output. All nullable,
+-- no default, so the 12:30/Apify pipeline's existing inserts (which never populate them)
+-- are unaffected. A host with the table already created needs:
+--   ALTER TABLE growth_agent_prospects ADD COLUMN IF NOT EXISTS instagram_url VARCHAR;
+--   ALTER TABLE growth_agent_prospects ADD COLUMN IF NOT EXISTS facebook_url VARCHAR;
+--   ALTER TABLE growth_agent_prospects ADD COLUMN IF NOT EXISTS country VARCHAR;
+--   ALTER TABLE growth_agent_prospects ADD COLUMN IF NOT EXISTS sells TEXT;
+--   ALTER TABLE growth_agent_prospects ADD COLUMN IF NOT EXISTS sales_evidence TEXT;
+--   ALTER TABLE growth_agent_prospects ADD COLUMN IF NOT EXISTS activity_notes TEXT;
+--   ALTER TABLE growth_agent_prospects ADD COLUMN IF NOT EXISTS platform VARCHAR;
+--   ALTER TABLE growth_agent_prospects ADD COLUMN IF NOT EXISTS contact_name VARCHAR;
+--   ALTER TABLE growth_agent_prospects ADD COLUMN IF NOT EXISTS other_contact VARCHAR;
+--   ALTER TABLE growth_agent_prospects ADD COLUMN IF NOT EXISTS fit_reason TEXT;
+--   ALTER TABLE growth_agent_prospects ADD COLUMN IF NOT EXISTS personalization_note TEXT;
+--   ALTER TABLE growth_agent_prospects ADD COLUMN IF NOT EXISTS lead_quality VARCHAR;
 
 BEGIN;
 
@@ -84,10 +104,25 @@ CREATE TABLE IF NOT EXISTS growth_agent_prospects (
     last_surfaced_at TIMESTAMP,
     outcome_note TEXT,
     resolved_at TIMESTAMP,
-    segment VARCHAR NOT NULL DEFAULT 'shopify_smb'  -- 'shopify_smb' (12:30 Apify/Shopify task) |
+    segment VARCHAR NOT NULL DEFAULT 'shopify_smb', -- 'shopify_smb' (12:30 Apify/Shopify task) |
                                                      -- 'social_commerce' (18:30 Instagram-first task) -
                                                      -- lets the two acquisition-channel experiments share
                                                      -- one tracking table and still be compared/queried apart
+    -- Everything below is nullable, additive research detail - populated by the
+    -- social_commerce (18:30) task's manual research today, left NULL by the 12:30/Apify
+    -- pipeline (see EXAMPLE #3 above).
+    instagram_url VARCHAR,
+    facebook_url VARCHAR,
+    country VARCHAR,
+    sells TEXT,
+    sales_evidence TEXT,
+    activity_notes TEXT,
+    platform VARCHAR,
+    contact_name VARCHAR,
+    other_contact VARCHAR,
+    fit_reason TEXT,
+    personalization_note TEXT,
+    lead_quality VARCHAR
 );
 GRANT SELECT, INSERT, UPDATE ON growth_agent_prospects TO growth_agent_tracking;
 GRANT USAGE, SELECT ON SEQUENCE growth_agent_prospects_id_seq TO growth_agent_tracking;
