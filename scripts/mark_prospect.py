@@ -53,6 +53,22 @@ def _cmd_list(segment=None):
             f"({p['status']}, surfaced {p['times_surfaced']}x, last {last}) "
             f"[{p['segment']}]"
         )
+        for field, label in (
+            ('contact_name', 'Contact'),
+            ('lead_quality', 'Lead quality'),
+            ('country', 'Country'),
+            ('platform', 'Platform'),
+            ('sells', 'Sells'),
+            ('sales_evidence', 'Sales evidence'),
+            ('activity_notes', 'Activity'),
+            ('instagram_url', 'Instagram'),
+            ('facebook_url', 'Facebook'),
+            ('other_contact', 'Other contact'),
+            ('fit_reason', 'Fit reason'),
+            ('personalization_note', 'Personalization'),
+        ):
+            if p.get(field):
+                print(f'  {label}: {p[field]}')
         if p.get('draft_message'):
             indented = '\n'.join(f'    {line}' for line in p['draft_message'].splitlines())
             print(f'  Draft message:\n{indented}')

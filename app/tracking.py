@@ -371,7 +371,7 @@ def mark_prospects_surfaced(prospects: List[Dict[str, Any]], segment: str = 'sho
 
     `segment` is written only on INSERT, never on the ON CONFLICT UPDATE - a
     prospect's segment is set once at creation and must never change on
-    re-surfacing, unlike draft_message below.
+    re-surfacing, unlike draft_message and the RESEARCH_FIELDS below.
 
     draft_message is the deliberate exception to "never overwrites": unlike
     business/website/email (static storefront facts), the LLM redrafts a
@@ -384,10 +384,30 @@ def mark_prospects_surfaced(prospects: List[Dict[str, Any]], segment: str = 'sho
     so an extraction miss degrades to "keep the old draft", never to
     silently wiping a good one.
 
+    RESEARCH_FIELDS (instagram_url, facebook_url, country, sells,
+    sales_evidence, activity_notes, platform, contact_name, other_contact,
+    fit_reason, personalization_note, lead_quality) follow the exact same
+    COALESCE(EXCLUDED.field, growth_agent_prospects.field) pattern as
+    draft_message, not the never-overwrite group business/website/email are
+    in - these are research findings that should improve on a later run with
+    better research, but a run that finds nothing new for a field must never
+    blank out a previously-good value.
+
     Raises on any error - scheduler.py catches, logs the greppable
     'TRACKING WRITE FAILED:' prefix, and never lets it block the (already
     sent) email. Returns the number of rows inserted or updated.
     """
+    RESEARCH_FIELDS = (
+        'instagram_url', 'facebook_url', 'country', 'sells', 'sales_evidence',
+        'activity_notes', 'platform', 'contact_name', 'other_contact',
+        'fit_reason', 'personalization_note', 'lead_quality',
+    )
+    research_columns = ', '.join(RESEARCH_FIELDS)
+    research_set = ',\n                    '.join(
+        f'{field} = COALESCE(EXCLUDED.{field}, growth_agent_prospects.{field})'
+        for field in RESEARCH_FIELDS
+    )
+
     by_domain: Dict[str, Dict[str, Any]] = {}
     for prospect in prospects:
         domain = prospect.get('domain')
@@ -399,16 +419,18 @@ def mark_prospects_surfaced(prospects: List[Dict[str, Any]], segment: str = 'sho
         affected = 0
         for domain, prospect in by_domain.items():
             cur.execute(
-                """
+                f"""
                 INSERT INTO growth_agent_prospects
-                    (domain, business, website, email, draft_message, status, times_surfaced, last_surfaced_at, segment)
-                VALUES (%s, %s, %s, %s, %s, 'surfaced', 1, now(), %s)
+                    (domain, business, website, email, draft_message, status, times_surfaced,
+                     last_surfaced_at, segment, {research_columns})
+                VALUES (%s, %s, %s, %s, %s, 'surfaced', 1, now(), %s, {', '.join(['%s'] * len(RESEARCH_FIELDS))})
                 ON CONFLICT (domain) DO UPDATE
                 SET last_surfaced_at = now(),
                     times_surfaced   = growth_agent_prospects.times_surfaced + 1,
                     draft_message    = COALESCE(EXCLUDED.draft_message, growth_agent_prospects.draft_message),
                     status = CASE WHEN growth_agent_prospects.status IN ('contacted', 'skipped')
-                                  THEN growth_agent_prospects.status ELSE 'surfaced' END
+                                  THEN growth_agent_prospects.status ELSE 'surfaced' END,
+                    {research_set}
                 """,
                 (
                     domain,
@@ -417,6 +439,7 @@ def mark_prospects_surfaced(prospects: List[Dict[str, Any]], segment: str = 'sho
                     prospect.get('email'),
                     prospect.get('draft_message'),
                     segment,
+                    *(prospect.get(field) for field in RESEARCH_FIELDS),
                 ),
             )
             affected += cur.rowcount
@@ -436,11 +459,20 @@ def get_reviewable_prospects(limit: int = 50, segment: Optional[str] = None) -> 
 
     Includes draft_message so a prospect can be reviewed and marked
     contacted/skipped straight from this CLI, without digging back through
-    old report emails to find what was actually drafted for it.
+    old report emails to find what was actually drafted for it. Also
+    includes the 11 research-detail fields (instagram_url, facebook_url,
+    country, sells, sales_evidence, activity_notes, platform, contact_name,
+    other_contact, fit_reason, personalization_note, lead_quality) - see
+    mark_prospects_surfaced's RESEARCH_FIELDS, same set.
     """
+    RESEARCH_FIELDS = (
+        'instagram_url', 'facebook_url', 'country', 'sells', 'sales_evidence',
+        'activity_notes', 'platform', 'contact_name', 'other_contact',
+        'fit_reason', 'personalization_note', 'lead_quality',
+    )
     query = (
         "SELECT domain, business, status, times_surfaced, last_surfaced_at, "
-        "first_seen_at, draft_message, segment "
+        "first_seen_at, draft_message, segment, " + ', '.join(RESEARCH_FIELDS) + " "
         "FROM growth_agent_prospects WHERE status = 'surfaced'"
     )
     params: List[Any] = []
@@ -462,6 +494,7 @@ def get_reviewable_prospects(limit: int = 50, segment: Optional[str] = None) -> 
                 'first_seen_at': r[5].isoformat() if r[5] else None,
                 'draft_message': r[6],
                 'segment': r[7],
+                **dict(zip(RESEARCH_FIELDS, r[8:])),
             }
             for r in cur.fetchall()
         ]
