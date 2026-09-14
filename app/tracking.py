@@ -27,6 +27,15 @@ LOGGER = logging.getLogger(__name__)
 
 VALID_CATEGORIES = ('action', 'experiment')
 
+# growth_agent_prospects' 11 nullable research-detail columns (see sql/schema.sql
+# EXAMPLE #3) - shared by mark_prospects_surfaced (writes them) and
+# get_reviewable_prospects (reads them) so the two never drift apart.
+RESEARCH_FIELDS = (
+    'instagram_url', 'facebook_url', 'country', 'sells', 'sales_evidence',
+    'activity_notes', 'platform', 'contact_name', 'other_contact',
+    'fit_reason', 'personalization_note', 'lead_quality',
+)
+
 
 def _get_tracking_database_url() -> str:
     url = os.environ.get('GROWTH_AGENT_TRACKING_DATABASE_URL', '')
@@ -371,7 +380,7 @@ def mark_prospects_surfaced(prospects: List[Dict[str, Any]], segment: str = 'sho
 
     `segment` is written only on INSERT, never on the ON CONFLICT UPDATE - a
     prospect's segment is set once at creation and must never change on
-    re-surfacing, unlike draft_message and the RESEARCH_FIELDS below.
+    re-surfacing, unlike draft_message and RESEARCH_FIELDS below.
 
     draft_message is the deliberate exception to "never overwrites": unlike
     business/website/email (static storefront facts), the LLM redrafts a
@@ -397,11 +406,6 @@ def mark_prospects_surfaced(prospects: List[Dict[str, Any]], segment: str = 'sho
     'TRACKING WRITE FAILED:' prefix, and never lets it block the (already
     sent) email. Returns the number of rows inserted or updated.
     """
-    RESEARCH_FIELDS = (
-        'instagram_url', 'facebook_url', 'country', 'sells', 'sales_evidence',
-        'activity_notes', 'platform', 'contact_name', 'other_contact',
-        'fit_reason', 'personalization_note', 'lead_quality',
-    )
     research_columns = ', '.join(RESEARCH_FIELDS)
     research_set = ',\n                    '.join(
         f'{field} = COALESCE(EXCLUDED.{field}, growth_agent_prospects.{field})'
@@ -460,16 +464,11 @@ def get_reviewable_prospects(limit: int = 50, segment: Optional[str] = None) -> 
     Includes draft_message so a prospect can be reviewed and marked
     contacted/skipped straight from this CLI, without digging back through
     old report emails to find what was actually drafted for it. Also
-    includes the 11 research-detail fields (instagram_url, facebook_url,
+    includes the module-level RESEARCH_FIELDS (instagram_url, facebook_url,
     country, sells, sales_evidence, activity_notes, platform, contact_name,
-    other_contact, fit_reason, personalization_note, lead_quality) - see
-    mark_prospects_surfaced's RESEARCH_FIELDS, same set.
+    other_contact, fit_reason, personalization_note, lead_quality) - the
+    same set mark_prospects_surfaced writes.
     """
-    RESEARCH_FIELDS = (
-        'instagram_url', 'facebook_url', 'country', 'sells', 'sales_evidence',
-        'activity_notes', 'platform', 'contact_name', 'other_contact',
-        'fit_reason', 'personalization_note', 'lead_quality',
-    )
     query = (
         "SELECT domain, business, status, times_surfaced, last_surfaced_at, "
         "first_seen_at, draft_message, segment, " + ', '.join(RESEARCH_FIELDS) + " "
